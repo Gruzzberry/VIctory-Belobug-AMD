@@ -133,6 +133,15 @@ pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;
 /// 4K screen is about 10^13 iterations); a much lower limit shows whether
 /// such loops are what makes a frame slow. The value is part of the
 /// translation, so the shader cache must key on it (`victory-gpu`'s does).
+/// Groups of several console waves run in halves through arrival flags
+/// (`lower::Lower::exchange_waves`) only when `VICTORY_WAVE64_MULTI` is set:
+/// a wait that never ends hangs the GPU until the driver resets it, and the
+/// protocol still loses a flag now and then (see docs/wave64-on-wave32.md).
+pub(crate) fn multi_wave_groups() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| cfg!(test) || std::env::var_os("VICTORY_WAVE64_MULTI").is_some())
+}
+
 pub fn loop_limit() -> u32 {
     static LIMIT: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     *LIMIT.get_or_init(|| {

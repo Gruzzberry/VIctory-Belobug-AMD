@@ -423,3 +423,48 @@ fn loops_with_an_exit_mask_grown_from_zero() {
     ];
     console_flow_case("exit-mask loop reading lane 40", &body, 64, |_| 40 + 64);
 }
+
+/// Many groups of several console waves with exchanges in each: the waits
+/// are short, no group holds the GPU (a dispatch past ~2 s is reset by the
+/// driver) and every lane is right.
+#[test]
+fn many_groups_of_several_console_waves_finish_fast() {
+    let Ok(names) = adapters() else {
+        return;
+    };
+    // Lane 10 of each console wave, a count of the lanes below 40, then a
+    // lane read inside a branch.
+    let body = [
+        0xD760_0009,
+        0x0001_1500, // v_readlane_b32 s9, v0, 10
+        0x7D88_00A8, // v_cmp_gt_u32 vcc, 40, v0
+        0xBE8A_106A, // s_bcnt1_i32_b64 s10, vcc
+        0x8109_0A09, // s_add_i32 s9, s9, s10
+        0x7E04_0209, // v_mov_b32 v2, s9
+    ];
+    let (threads, groups) = (256u32, std::env::var("W64_GROUPS").ok().and_then(|g| g.parse().ok()).unwrap_or(4096u32));
+    for name in names {
+        let Ok(host) = Host::on(&name) else {
+            continue;
+        };
+        if !host.target().runs(32) && !host.target().runs(64) {
+            continue;
+        }
+        let start = std::time::Instant::now();
+        let out = run(&host, &program(&body, threads), groups)
+            .unwrap_or_else(|e| panic!("{name}: {e}"));
+        let took = start.elapsed();
+        // v0 holds the group thread id: wave w's lane 10 is 64 w + 10, and
+        // its ids below 40 are 40 in wave 0 only.
+        let bad = (0..threads * groups)
+            .filter(|&i| {
+                let t = i % threads;
+                out[i as usize] != t / 64 * 64 + 10 + u32::from(t < 64) * 40
+            })
+            .count();
+        let sample: Vec<_> = (0..threads * groups).filter(|&i| { let t = i % threads; out[i as usize] != t / 64 * 64 + 10 + u32::from(t < 64) * 40 }).take(6).map(|i| (i / threads, i % threads, out[i as usize])).collect();
+        eprintln!("{name}: {groups} groups of {threads}: {bad} wrong, {took:?}, e.g. {sample:?}");
+        assert_eq!(bad, 0, "{name}");
+        assert!(took.as_secs() < 5, "{name}: {took:?}");
+    }
+}

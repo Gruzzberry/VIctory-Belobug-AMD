@@ -543,6 +543,19 @@ impl Module {
         let V::Inst(i) = phi else { panic!() };
         self.insts[i as usize].op = Op::Phi(incoming);
     }
+    /// How many instructions `block` holds.
+    pub fn body_len(&self, block: usize) -> usize {
+        self.blocks[block].body.len()
+    }
+    /// Moves what `block` got after its first `from` instructions to just after
+    /// instruction `anchor` (which must be in it, before them).
+    pub fn move_after(&mut self, block: usize, anchor: V, from: usize) {
+        let V::Inst(a) = anchor else { return };
+        let body = &mut self.blocks[block].body;
+        let new = body.split_off(from);
+        let at = body.iter().position(|&i| i == a).map_or(0, |p| p + 1);
+        body.splice(at..at, new);
+    }
     /// Where code for `block` goes: past the blocks code was moved on from.
     fn resolve(&self, mut block: usize) -> usize {
         while let Some(next) = self.blocks[block].onward {

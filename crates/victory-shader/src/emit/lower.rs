@@ -1210,7 +1210,8 @@ impl<'a> Lower<'a> {
                 && x.native.wave64
                 && !x.target.runs(64)
                 && x.target.runs(32)
-                && (cs.threads.iter().product::<u32>() <= 64 || s.lds_dwords == 0)
+                && (cs.threads.iter().product::<u32>() <= 64
+                    || s.lds_dwords == 0 && super::multi_wave_groups())
                 && !insts().any(|i| i.name().contains("permute"));
             // On a host that runs the console's wave size: lane reads and
             // writes in a program whose lanes branch differently (see
@@ -2165,6 +2166,7 @@ impl<'a> Lower<'a> {
             self.tail[b] = Some(self.cur);
             self.exit(b)?;
         }
+        self.finish_waves();
         self.fill_phis()?;
         if self.s.pixel {
             settle_position_mode(&mut self.s.inputs);
@@ -2175,6 +2177,60 @@ impl<'a> Lower<'a> {
         let user_data = self.user_reads.values().copied().collect();
         self.s.samplers = self.samplers.len() as u32;
         Ok(user_data)
+    }
+
+    /// Groups of several console waves with exchanges (see `exchange_waves`):
+    /// the arrival flags start at 0 (group-shared memory holds what an earlier
+    /// group left), set before any thread branches; and a half whose threads
+    /// all leave the dispatch early (the last group's threads past the count)
+    /// marks its flag so the other half does not wait for it.
+    fn finish_waves(&mut self) {
+        let Some((_, xflags, _)) = self.xwaves else {
+            return;
+        };
+        let threads: u32 = self.s.threads.expect("compute").iter().product();
+        let n = self.s.m.i32(threads.div_ceil(64) * 2);
+        let e = self.s.entry;
+        let flat = self.console_flat();
+        let from = self.s.m.body_len(e);
+        let at = self.s.m.bin(e, Bin::URem, flat, n);
+        let zero = self.s.m.i32(0);
+        let flag = self.s.m.element(e, xflags, at);
+        self.s.m.store(e, flag, zero);
+        let void = self.s.t.void;
+        let mode = self.s.m.i32(1 | 8);
+        self.s
+            .op(e, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+        // Before everything that uses the flags: the entry block may hold the
+        // first exchange already.
+        self.s.m.move_after(e, flat, from);
+        if let Some(a) = self.abort {
+            // The lanes that left: when the first of them is its host wave's
+            // first lane, the lanes left are all of the half.
+            let i32t = self.s.t.i32;
+            let first = self
+                .s
+                .op(a, "waveReadLaneFirst.i32", Attr::NoUnwind, i32t, 118, &[flat]);
+            let (k31, k6, k1, k2) = (
+                self.s.m.i32(31),
+                self.s.m.i32(6),
+                self.s.m.i32(1),
+                self.s.m.i32(2),
+            );
+            let low = self.s.m.bin(a, Bin::And, first, k31);
+            let whole = self.s.m.cmp(a, pred::EQ, low, zero);
+            let w = self.s.m.bin(a, Bin::LShr, first, k6);
+            let k5 = self.s.m.i32(5);
+            let h = self.s.m.bin(a, Bin::LShr, first, k5);
+            let h = self.s.m.bin(a, Bin::And, h, k1);
+            let w2 = self.s.m.bin(a, Bin::Mul, w, k2);
+            let at = self.s.m.bin(a, Bin::Add, w2, h);
+            let mark = self.s.m.i32(u32::MAX);
+            let value = self.s.m.select(a, whole, mark, zero);
+            let flag = self.s.m.element(a, xflags, at);
+            self.s.m.atomic(a, Rmw::Or, flag, value);
+            self.s.flags |= flags::WAVE_OPS;
+        }
     }
 
     fn exported_out(&self, b: usize) -> bool {
@@ -12832,7 +12888,9 @@ impl<'a> Lower<'a> {
     /// exchange ahead, and the parity keeps it from overwriting a slot still
     /// being read. Code goes on in `self.cur` afterwards (not the block given).
     fn exchange_waves(&mut self, x: V) -> (V, V) {
-        const SPIN_LIMIT: u32 = 1 << 20;
+        // Short: a wait that runs out costs this many polls per exchange in
+        // every group, and the driver resets a GPU a dispatch holds for 2 s.
+        const SPIN_LIMIT: u32 = 1 << 14;
         let threads: u32 = self.s.threads.expect("compute").iter().product();
         let waves = threads.div_ceil(64);
         let i32t = self.s.t.i32;
@@ -12889,32 +12947,59 @@ impl<'a> Lower<'a> {
         let void = self.s.t.void;
         let fence = self.s.m.i32(8);
         let slot = self.s.m.element(c, slots, mine);
-        self.s.m.store(c, slot, x);
+        // Atomics, so no cache or reordering of plain accesses can show the
+        // flag before the data.
+        self.s.m.atomic(c, Rmw::Xchg, slot, x);
         self.s
             .op(c, "barrier", Attr::NoDuplicate, void, 80, &[fence]);
         let flag = self.s.m.element(c, flags, my_flag);
         self.s.m.atomic(c, Rmw::Xchg, flag, k1);
         let spin = self.s.m.new_block();
+        let poll = self.s.m.new_block();
+        let join = self.s.m.new_block();
         let done = self.s.m.new_block();
         self.s.m.terminate(c, Term::Br(spin));
         let n = self.s.m.phi(spin, i32t);
-        let theirs_flag = self.s.m.element(spin, flags, their_flag);
-        let seen = self.s.m.atomic(spin, Rmw::Or, theirs_flag, z);
-        let arrived = self.s.m.cmp(spin, pred::IUGE, seen, k1);
-        let next = self.s.m.bin(spin, Bin::Add, n, one);
+        // One lane of the wave reads the flag, the rest take its verdict: 32
+        // lanes polling one address would queue behind each other.
+        let lane = self.s.op(
+            spin,
+            "waveGetLaneIndex",
+            Attr::ReadOnly,
+            i32t,
+            111,
+            &[],
+        );
+        let first = self.s.m.cmp(spin, pred::EQ, lane, z);
+        self.s.m.terminate(spin, Term::CondBr(first, poll, join));
+        let theirs_flag = self.s.m.element(poll, flags, their_flag);
+        let read = self.s.m.atomic(poll, Rmw::Or, theirs_flag, z);
+        self.s.m.terminate(poll, Term::Br(join));
+        let mine_seen = self.s.m.phi(join, i32t);
+        self.s.m.set_phi(mine_seen, vec![(read, poll), (z, spin)]);
+        let seen = self
+            .s
+            .op(join, "waveReadLaneFirst.i32", Attr::NoUnwind, i32t, 118, &[mine_seen]);
+        let arrived = self.s.m.cmp(join, pred::IUGE, seen, k1);
+        let next = self.s.m.bin(join, Bin::Add, n, one);
         let limit = self.s.m.i32(SPIN_LIMIT);
-        let over = self.s.m.cmp(spin, pred::IUGE, next, limit);
-        let stop = self.s.m.bin(spin, Bin::Or, arrived, over);
-        let stop = self.s.m.bin(spin, Bin::Or, stop, alone);
-        self.s.m.set_phi(n, vec![(z, c), (next, spin)]);
-        self.s.m.terminate(spin, Term::CondBr(stop, done, spin));
+        let over = self.s.m.cmp(join, pred::IUGE, next, limit);
+        let stop = self.s.m.bin(join, Bin::Or, arrived, over);
+        let stop = self.s.m.bin(join, Bin::Or, stop, alone);
+        self.s.m.set_phi(n, vec![(z, c), (next, join)]);
+        self.s.m.terminate(join, Term::CondBr(stop, done, spin));
+        self.s.flags |= flags::WAVE_OPS;
         self.s.m.continue_in(c, done);
         self.cur = done;
         self.s
             .op(done, "barrier", Attr::NoDuplicate, void, 80, &[fence]);
         let slot = self.s.m.element(done, slots, theirs);
-        let got = self.s.m.load(done, slot);
-        let got = self.s.m.select(done, alone, z, got);
+        let got = self.s.m.atomic(done, Rmw::Or, slot, z);
+        // A half that left the dispatch (see `finish_waves`) holds nothing.
+        let gone_flag = self.s.m.i32(u32::MAX);
+        let gone = self.s.m.cmp(done, pred::EQ, seen, gone_flag);
+        let missing = self.s.m.bin(done, Bin::Or, alone, gone);
+        let got = self.s.m.select(done, missing, z, got);
         let first = self.s.m.cmp(done, pred::EQ, half, z);
         let lo = self.s.m.select(done, first, x, got);
         let hi = self.s.m.select(done, first, got, x);

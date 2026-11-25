@@ -184,3 +184,17 @@ the finding that NVIDIA forms waves from non-consecutive thread ids in some
 3-D groups, come from XCL's design notes (`docs/wave64-on-wave32.md` in
 github.com/ivall/xcl and its fork Bathyal). XCL is GPL-2.0-only. Nothing
 here is copied from its code.
+
+## Groups of several console waves (opt-in: `VICTORY_WAVE64_MULTI=1`)
+
+The halves of one console wave meet through group-shared slots and arrival
+flags (`Lower::exchange_waves`): the k-th exchange stores its dword in slot
+(wave, half, k parity), fences, sets its flag to k + 1, and waits for the
+other half's (one lane polls, the rest take its verdict; the wait is capped).
+Flags start at 0 (set before the first exchange), and a half whose threads all
+leave the dispatch marks its flag. It is off by default: with 4096 groups of
+256 threads and three exchanges each, a few groups read the other half's word
+as 0 and some waits run to the cap (seconds in a dispatch, which the driver
+resets as a hang). The cause is not found; the cap was 2^20 polls in the first
+version, which hung the GPU in the world (device removed, 0x887A0006).
+`many_groups_of_several_console_waves_finish_fast` shows it (`W64_GROUPS`).
