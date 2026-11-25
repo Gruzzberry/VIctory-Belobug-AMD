@@ -33,6 +33,13 @@ const EXCEPTIONS: &[(&str, &str)] = &[(
     "the BCPack format's constant tables: nothing decodes without them and they cannot be derived (owner's decision, 2026-11-23; docs/asset-policy.md)",
 )];
 
+/// Hand-written source files allowed past the size limit; every other check
+/// (file type, magic, NUL bytes, encoded runs) still runs on them.
+const SIZE_EXCEPTIONS: &[(&str, &str)] = &[(
+    "crates/victory-shader/src/emit/lower.rs",
+    "the DXIL lowering, hand-written source that has grown past the limit",
+)];
+
 /// Signatures of formats that must never be committed.
 const FORBIDDEN_MAGIC: &[(&[u8], &str)] = &[
     (b"MZ", "PE executable"),
@@ -154,7 +161,7 @@ pub fn check(path: &str, content: &[u8]) -> Vec<String> {
     if !allowed {
         problems.push("file type not on the allowlist".to_owned());
     }
-    if content.len() > MAX_FILE_SIZE {
+    if content.len() > MAX_FILE_SIZE && !SIZE_EXCEPTIONS.iter().any(|(p, _)| *p == path) {
         problems.push(format!(
             "{} bytes exceeds the {MAX_FILE_SIZE}-byte limit",
             content.len()
@@ -213,6 +220,11 @@ mod tests {
             !check("a.rs", &vec![b'a'; 600 * 1024]).is_empty(),
             "too big"
         );
+        // A size exception keeps the other checks.
+        let lower = "crates/victory-shader/src/emit/lower.rs";
+        assert!(check(lower, &vec![b'a'; 600 * 1024]).len() == 1, "long run only");
+        assert!(check(lower, b"fn main() {}\n").is_empty());
+        assert!(!check(lower, b"MZ\x90\0").is_empty());
     }
 
     #[test]
