@@ -306,6 +306,23 @@ impl Host {
         }
     }
 
+    /// A pipeline of `kind` ("compute", "mesh" or "graphics") from a
+    /// serialised root signature and its stages' code (the compute shader;
+    /// the mesh and pixel shaders; the vertex and pixel shaders), as a
+    /// running title made them: for trying what a driver's compiler crashed
+    /// on in a process of its own.
+    pub fn from_dump(&self, kind: &str, root: &[u8], code: &[Vec<u8>]) -> Result<(), String> {
+        // SAFETY: the bytes are a serialised root signature.
+        let root = unsafe { self.device.CreateRootSignature::<ID3D12RootSignature>(0, root) }
+            .map_err(|e| format!("root signature: {}", err(e)))?;
+        let stage = |i: usize| code.get(i).ok_or_else(|| format!("no stage {i}"));
+        match kind {
+            "compute" => self.compute_pipeline_with(&root, stage(0)?).map(drop),
+            "mesh" => self.mesh_pipeline_with(&root, stage(0)?, stage(1)?).map(drop),
+            _ => self.pipeline_with(&root, stage(0)?, stage(1)?).map(drop),
+        }
+    }
+
     /// A compute pipeline; user data is root parameter 0.
     pub fn compute_pipeline(
         &self,

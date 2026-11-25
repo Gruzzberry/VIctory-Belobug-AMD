@@ -106,6 +106,32 @@ pub(crate) fn name(kind: &str, root: &[u8], code: &[&[u8]], state: &str) -> Stri
     h.finalize().to_hex()[..32].to_owned()
 }
 
+/// Diagnostics: with `VICTORY_NAME_PIPELINES` set, each pipeline's name is
+/// logged next to its shaders; with `VICTORY_DUMP_CRASHED=dir`, the
+/// description of one the driver crashed on before (`crashed.txt`) is
+/// written to `dir` before it is made again (`VICTORY_RETRY_CRASHED`), to
+/// be tried in a process of its own.
+pub(crate) fn inspect(name: &str, kind: &str, shaders: &str, root: &[u8], code: &[&[u8]], state: &str) {
+    if std::env::var_os("VICTORY_NAME_PIPELINES").is_some() {
+        tracing::info!(name, kind, shaders, "pipeline named");
+    }
+    let Some(dir) = std::env::var_os("VICTORY_DUMP_CRASHED") else { return };
+    let listed = DIR
+        .get()
+        .and_then(|d| std::fs::read_to_string(d.join(CRASHED_FILE)).ok())
+        .is_some_and(|t| t.lines().any(|l| l == name));
+    if !listed {
+        return;
+    }
+    let base = PathBuf::from(dir).join(name);
+    let _ = std::fs::create_dir_all(&base);
+    let _ = std::fs::write(base.join("root.bin"), root);
+    for (i, c) in code.iter().enumerate() {
+        let _ = std::fs::write(base.join(format!("code{i}.dxil")), c);
+    }
+    let _ = std::fs::write(base.join("what.txt"), format!("{kind}\n{shaders}\n{state}\n"));
+}
+
 /// Pipelines a driver's compiler crashed on (names, one per line).
 const CRASHED_FILE: &str = "crashed.txt";
 
@@ -122,8 +148,12 @@ fn note_crashed(name: &str) {
     }
 }
 
-/// Whether the driver crashed making the pipeline named `name` before.
+/// Whether the driver crashed making the pipeline named `name` before
+/// (`VICTORY_RETRY_CRASHED` makes it try again).
 fn crashed(name: &str) -> bool {
+    if std::env::var_os("VICTORY_RETRY_CRASHED").is_some() {
+        return false;
+    }
     static NAMES: OnceLock<std::collections::HashSet<String>> = OnceLock::new();
     NAMES
         .get_or_init(|| {
@@ -153,6 +183,7 @@ impl Making {
         // SAFETY: a handler that lives as long as the process.
         HANDLER.call_once(|| unsafe {
             AddVectoredExceptionHandler(1, Some(compiler_crashed));
+            victory_core::unhandled::set_hook(unhandled);
         });
         MAKING.with(|m| name.clone_into(&mut m.borrow_mut()));
         endless(name, true);
@@ -324,31 +355,74 @@ impl Drop for Making {
     }
 }
 
-unsafe extern "system" fn compiler_crashed(
+/// The faults of the driver's compiler that something handled (the driver
+/// takes some on purpose), counted since the start.
+static HANDLED: AtomicU64 = AtomicU64::new(0);
+
+/// The access violation in `record`, if it is one the driver's compiler
+/// raises on this thread: a read or write of the first pages.
+fn compiler_fault(
     info: *mut windows_sys::Win32::System::Diagnostics::Debug::EXCEPTION_POINTERS,
-) -> i32 {
+) -> Option<String> {
     const ACCESS_VIOLATION: i32 = 0xc000_0005_u32 as i32;
     // SAFETY: the system passes a live record.
     let record = unsafe { &*(*info).ExceptionRecord };
     let name = MAKING.try_with(|m| m.try_borrow().map(|m| m.clone()).unwrap_or_default());
     let name = name.unwrap_or_default();
-    // Only reads or writes of the first pages: our own guards' faults are
-    // elsewhere.
-    if record.ExceptionCode != ACCESS_VIOLATION
-        || name.is_empty()
-        || record.ExceptionInformation[1] >= 0x10000
-    {
-        return 0; // not ours
-    }
+    // Our own guards' faults are elsewhere.
+    (record.ExceptionCode == ACCESS_VIOLATION
+        && !name.is_empty()
+        && record.ExceptionInformation[1] < 0x10000)
+        .then_some(name)
+}
+
+/// The compiler's thread is parked for good: its pipeline is left out from
+/// now on and the others, and the title, go on.
+fn park_crashed(name: &str) -> ! {
     tracing::error!(name, "the driver's compiler crashed making a pipeline: it is left out");
-    note_crashed(&name);
-    endless(&name, false);
+    note_crashed(name);
+    endless(name, false);
     // SAFETY: a plain call.
     let id = unsafe { windows::Win32::System::Threading::GetCurrentThreadId() };
     LOST.lock().unwrap_or_else(|e| e.into_inner()).push(id);
     loop {
         std::thread::sleep(std::time::Duration::from_secs(3600));
     }
+}
+
+/// First chance. The driver's compiler takes some access violations of the
+/// first pages itself (NVIDIA's does; its handlers run after this one), so
+/// by default only the ones nothing handles are crashes (`unhandled`
+/// below); `VICTORY_COMPILER_FAULTS=first` has every one count, as the
+/// first versions did.
+unsafe extern "system" fn compiler_crashed(
+    info: *mut windows_sys::Win32::System::Diagnostics::Debug::EXCEPTION_POINTERS,
+) -> i32 {
+    let Some(name) = compiler_fault(info) else { return 0 };
+    static FIRST: OnceLock<bool> = OnceLock::new();
+    if *FIRST.get_or_init(|| std::env::var("VICTORY_COMPILER_FAULTS").is_ok_and(|v| v == "first")) {
+        park_crashed(&name);
+    }
+    if HANDLED.fetch_add(1, Ordering::Relaxed) < 5 {
+        // SAFETY: a live record.
+        let at = unsafe { (*(*info).ExceptionRecord).ExceptionAddress } as usize;
+        tracing::warn!(name, at, "a fault in the driver's compiler; it is a crash if nothing handles it");
+    }
+    0
+}
+
+/// Last chance: nothing handled the access violation, so the driver's
+/// compiler did crash.
+extern "system" fn unhandled(info: *const std::ffi::c_void) {
+    let name = compiler_fault(info.cast_mut().cast());
+    if let Some(name) = name {
+        park_crashed(&name);
+    }
+}
+
+/// Faults of the driver's compiler that something handled, since the start.
+pub(crate) fn handled_faults() -> u64 {
+    HANDLED.load(Ordering::Relaxed)
 }
 
 /// The pipeline named `name`: loaded from the library by `load` if it is
@@ -434,6 +508,7 @@ pub(crate) fn save(now: bool) {
                 made = MADE.load(Ordering::Relaxed),
                 loaded = LOADED.load(Ordering::Relaxed),
                 started_early = EARLY.load(Ordering::Relaxed),
+                handled_faults = handled_faults(),
                 "host pipeline library saved"
             );
         }

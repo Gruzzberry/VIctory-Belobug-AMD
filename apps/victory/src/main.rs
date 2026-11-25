@@ -67,6 +67,15 @@ enum Command {
         #[arg(long)]
         disasm: bool,
     },
+    /// Make the host pipeline a run dumped (`VICTORY_DUMP_CRASHED`: root.bin,
+    /// code0.dxil, code1.dxil, what.txt) in this process, to see whether
+    /// the driver's compiler survives it. Exits 0 if it does.
+    TryDump {
+        dir: PathBuf,
+        /// Replace the stage's code with this file (stage 0 or 1: `0=file`).
+        #[arg(long, value_name = "N=FILE")]
+        with: Vec<String>,
+    },
     /// Run every shader found (containers, SGD5 files) through the
     /// translator and report what it cannot handle yet.
     Translate {
@@ -152,6 +161,7 @@ fn main() -> Result<()> {
             verbose,
             disasm,
         } => shader::run(paths, verbose || disasm, disasm),
+        Command::TryDump { dir, with } => translate::try_dump(&dir, &with),
         Command::Translate {
             paths,
             validate,

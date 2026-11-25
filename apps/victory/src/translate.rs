@@ -534,6 +534,13 @@ fn check(
         );
     }
     if let Some((h, stub_ps)) = &checks.host {
+        // `VICTORY_PIPELINE_LOG`: each pipeline's label is appended to that
+        // file before the driver compiles it (the last of a run that dies is
+        // the culprit); labels in `VICTORY_PIPELINE_SKIP` (one per line) are
+        // not made.
+        if skipped(&label()) {
+            return;
+        }
         let made = match shader.stage {
             HwStage::Vs => h.pipeline(&shader, stub_ps).map(drop),
             HwStage::Cs => h.compute_pipeline(&shader).map(drop),
@@ -769,4 +776,46 @@ fn tally_structured(program: &ir::Program, s: &structure::Structured, t: &mut Ta
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Appends `label` to `VICTORY_PIPELINE_LOG` (with the thread) and says
+/// whether `VICTORY_PIPELINE_SKIP` lists it.
+fn skipped(label: &str) -> bool {
+    use std::io::Write;
+    static SKIP: std::sync::OnceLock<HashSet<String>> = std::sync::OnceLock::new();
+    let skip = SKIP.get_or_init(|| {
+        std::env::var_os("VICTORY_PIPELINE_SKIP")
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .map(|t| t.lines().map(str::to_owned).collect())
+            .unwrap_or_default()
+    });
+    if skip.contains(label) {
+        return true;
+    }
+    if let Some(log) = std::env::var_os("VICTORY_PIPELINE_LOG")
+        && let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(log)
+    {
+        let _ = writeln!(f, "{:?}	{label}", std::thread::current().id());
+    }
+    false
+}
+
+/// Makes the pipeline a run dumped in `dir`, with some stages' code
+/// replaced; the process dies if the driver's compiler does.
+pub fn try_dump(dir: &Path, with: &[String]) -> Result<()> {
+    let what = std::fs::read_to_string(dir.join("what.txt"))?;
+    let kind = what.lines().next().unwrap_or("graphics");
+    let root = std::fs::read(dir.join("root.bin"))?;
+    let mut code = Vec::new();
+    while let Ok(c) = std::fs::read(dir.join(format!("code{}.dxil", code.len()))) {
+        code.push(c);
+    }
+    for w in with {
+        let (n, file) = w.split_once('=').ok_or_else(|| anyhow::anyhow!("N=FILE"))?;
+        code[n.parse::<usize>()?] = std::fs::read(file)?;
+    }
+    let host = Host::new(false).map_err(|e| anyhow::anyhow!("device: {e}"))?;
+    host.from_dump(kind, &root, &code).map_err(anyhow::Error::msg)?;
+    println!("made");
+    Ok(())
 }
