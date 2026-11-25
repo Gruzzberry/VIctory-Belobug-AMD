@@ -1001,6 +1001,7 @@ impl Host {
                 victory_shader::emit::Target {
                     lanes_min: options.WaveLaneCountMin,
                     lanes_max: options.WaveLaneCountMax,
+                    ..victory_shader::emit::Target::ANY
                 }
             } else {
                 victory_shader::emit::Target::ANY

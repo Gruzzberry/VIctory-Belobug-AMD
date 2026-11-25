@@ -180,7 +180,13 @@ pub fn run(
         target = emit::Target {
             lanes_min,
             lanes_max,
+            ..emit::Target::ANY
         };
+    }
+    // `VICTORY_FIRST_LANE_OWN=1`: the retranslation the host makes of a mesh
+    // shader its driver refused (see `Target::first_lane_own`), for all.
+    if std::env::var_os("VICTORY_FIRST_LANE_OWN").is_some() {
+        target = target.with_first_lane_own();
     }
     if target != emit::Target::ANY {
         println!(
@@ -347,6 +353,13 @@ fn translate(
     checks: &mut Checks,
 ) {
     let example = || format!("{}{}", path.display(), source.label());
+    // `VICTORY_ONLY=<label part>,...`: only the programs whose label (path
+    // and offset) holds one of the parts.
+    if let Ok(only) = std::env::var("VICTORY_ONLY")
+        && !only.split(',').any(|part| example().contains(part))
+    {
+        return;
+    }
     let Some(bytes) = source.bytes() else {
         return t.fail("corrupt record".into(), example);
     };

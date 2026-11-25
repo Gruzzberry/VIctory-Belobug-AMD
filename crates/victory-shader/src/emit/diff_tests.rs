@@ -1285,3 +1285,175 @@ fn translated_compute_matches_pc() {
     let _ = std::fs::remove_dir_all(&dir);
     assert!(failures.is_empty(), "{failures:#?}");
 }
+
+/// Diagnostics: every mesh shader of a shader cache folder
+/// (`VICTORY_MS_CACHE=<dir>`) as a pipeline of its own (no pixel stage), on
+/// the host GPU; lists those the driver refuses.
+#[test]
+#[ignore = "needs a shader cache and a GPU"]
+fn cached_mesh_shaders_make_pipelines() {
+    let Ok(dir) = std::env::var("VICTORY_MS_CACHE") else {
+        return;
+    };
+    // One file per process: the driver may fault on a shader.
+    let dir = if let Ok(one) = std::env::var("VICTORY_MS_ONE") { one } else { dir };
+    if std::env::var("VICTORY_DEBUG_LAYER").is_ok() {
+        let mut layer: Option<ID3D12Debug> = None;
+        // SAFETY: plain debug interface calls.
+        unsafe {
+            if D3D12GetDebugInterface(&mut layer).is_ok() {
+                layer.unwrap().EnableDebugLayer();
+            }
+        }
+    }
+    let Ok(host) = Host::new(false) else {
+        return;
+    };
+    let queue = windows::core::Interface::cast::<ID3D12InfoQueue>(&host.device).ok();
+    let mut refused = 0;
+    let mut made = 0;
+    let mut stack = vec![PathBuf::from(dir)];
+    stack.retain(|p| p.exists());
+    while let Some(d) = stack.pop() {
+        let entries: Vec<PathBuf> = if d.is_dir() {
+            std::fs::read_dir(&d).unwrap().flatten().map(|e| e.path()).collect()
+        } else {
+            vec![d.clone()]
+        };
+        for p in entries {
+            if p.is_dir() {
+                stack.push(p);
+                continue;
+            }
+            let Some(s) = decode_entry(&std::fs::read(&p).unwrap()) else {
+                continue;
+            };
+            if s.stage != super::HwStage::Ms {
+                continue;
+            }
+            let ps = super::host::stub_ps();
+            let root = host
+                .root_signature_for(&[
+                    (&s, D3D12_SHADER_VISIBILITY_MESH),
+                    (&ps, D3D12_SHADER_VISIBILITY_PIXEL),
+                ])
+                .unwrap();
+            match host.mesh_pipeline_with(&root, &s.dxil, &ps.dxil) {
+                Ok(_) => made += 1,
+                Err(e) => {
+                    refused += 1;
+                    eprintln!("refused {}: {e}", p.display());
+                    if let Some(q) = &queue {
+                        // SAFETY: messages are read into buffers of the reported size.
+                        unsafe {
+                            for i in 0..q.GetNumStoredMessages() {
+                                let mut size = 0usize;
+                                let _ = q.GetMessage(i, None, &mut size);
+                                let mut buf = vec![0u64; size.div_ceil(8)];
+                                let m = buf.as_mut_ptr().cast::<D3D12_MESSAGE>();
+                                if q.GetMessage(i, Some(m), &mut size).is_ok() {
+                                    let m = &*m;
+                                    let t = std::slice::from_raw_parts(
+                                        m.pDescription,
+                                        m.DescriptionByteLength,
+                                    );
+                                    eprintln!("D3D12 {}: {}", m.ID.0, String::from_utf8_lossy(t));
+                                }
+                            }
+                            q.ClearStoredMessages();
+                        }
+                    }
+                }
+            }
+        }
+    }
+    eprintln!("made {made}, refused {refused}");
+}
+
+/// The cache entry encoding of `victory-gpu`'s shader cache.
+fn decode_entry(b: &[u8]) -> Option<HostShader> {
+    use super::{StaticSampler, UserData};
+    struct Reader<'a>(&'a [u8]);
+    impl<'a> Reader<'a> {
+        fn take(&mut self, n: usize) -> Option<&'a [u8]> {
+            let (head, rest) = self.0.split_at_checked(n)?;
+            self.0 = rest;
+            Some(head)
+        }
+        fn word(&mut self) -> Option<u32> {
+            Some(u32::from_le_bytes(self.take(4)?.try_into().ok()?))
+        }
+        fn list(&mut self) -> Option<Vec<u8>> {
+            let n = self.word()? as usize;
+            Some(self.take(n)?.to_vec())
+        }
+    }
+    let mut r = Reader(b);
+    if r.take(4)? != b"VSH2" {
+        return None;
+    }
+    let stages = [
+        super::HwStage::Ls,
+        super::HwStage::Hs,
+        super::HwStage::Es,
+        super::HwStage::Gs,
+        super::HwStage::Vs,
+        super::HwStage::Ps,
+        super::HwStage::Ms,
+        super::HwStage::Cs,
+    ];
+    let stage = *stages.get(r.word()? as usize)?;
+    let dxil = r.list()?;
+    let n = r.word()? as usize;
+    let mut user_data = Vec::new();
+    for _ in 0..n {
+        user_data.push(UserData {
+            index: r.word()?,
+            slot: r.word()? as u8,
+            root: match r.word()? {
+                0 => RootType::Constants,
+                1 => RootType::Descriptor,
+                2 => RootType::Table,
+                3 => RootType::ImmediateSampler,
+                4 => RootType::ResourceHeap,
+                5 => RootType::SamplerHeap,
+                x => RootType::Other(x - 6),
+            },
+            dword: r.word()?,
+        });
+    }
+    let n = r.word()? as usize;
+    let mut samplers = Vec::new();
+    for _ in 0..n {
+        samplers.push([r.word()?, r.word()?, r.word()?, r.word()?]);
+    }
+    let n = r.word()? as usize;
+    let mut static_samplers = Vec::new();
+    for _ in 0..n {
+        static_samplers.push(StaticSampler {
+            filter: r.word()?,
+            address: [r.word()?, r.word()?, r.word()?],
+            mip_lod_bias: f32::from_bits(r.word()?),
+            max_anisotropy: r.word()?,
+            comparison: r.word()?,
+            border: r.word()?,
+            min_lod: f32::from_bits(r.word()?),
+            max_lod: f32::from_bits(r.word()?),
+        });
+    }
+    let root_cbvs = r.list()?;
+    let root_srvs = r.list()?;
+    let root_uavs = r.list()?;
+    let stride_table = r.word()? != 0;
+    Some(HostShader {
+        stage,
+        dxil,
+        user_data,
+        samplers,
+        static_samplers,
+        root_cbvs,
+        root_srvs,
+        root_uavs,
+        stride_table,
+    })
+}

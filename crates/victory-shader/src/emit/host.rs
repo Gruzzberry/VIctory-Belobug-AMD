@@ -174,6 +174,7 @@ impl Host {
             super::Target {
                 lanes_min: o.WaveLaneCountMin,
                 lanes_max: o.WaveLaneCountMax,
+                ..super::Target::ANY
             }
         } else {
             super::Target::ANY
@@ -495,7 +496,7 @@ impl Host {
             dsv: Sub<DXGI_FORMAT>,
             samples: Sub<DXGI_SAMPLE_DESC>,
         }
-        let outputs = sig(ps, FourCC::OSG1)?;
+        let outputs = if ps.is_empty() { Vec::new() } else { sig(ps, FourCC::OSG1)? };
         let mut blend = D3D12_BLEND_DESC::default();
         for rt in &mut blend.RenderTarget {
             rt.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL.0 as u8;

@@ -246,6 +246,13 @@ pub struct UserData {
 pub struct Target {
     pub lanes_min: u32,
     pub lanes_max: u32,
+    /// `v_readfirstlane_b32` in a mesh shader takes the lane's own value:
+    /// the console compiler takes it of values it knows are the same in
+    /// every lane of the group's wave, and an NVIDIA driver cannot make a
+    /// pipeline (it runs out of memory, `E_OUTOFMEMORY`) of some mesh
+    /// shaders that hold a wave read in the middle of their address
+    /// arithmetic. For those shaders only, after the driver refused them.
+    pub first_lane_own: bool,
 }
 
 impl Target {
@@ -254,6 +261,7 @@ impl Target {
     pub const ANY: Target = Target {
         lanes_min: 4,
         lanes_max: 128,
+        first_lane_own: false,
     };
 
     /// Whether the host runs waves of `lanes`.
@@ -262,11 +270,21 @@ impl Target {
     }
 
     /// The range as bytes, for cache keys.
-    pub fn key(self) -> [u8; 8] {
-        let mut k = [0; 8];
+    pub fn key(self) -> [u8; 9] {
+        let mut k = [0; 9];
         k[..4].copy_from_slice(&self.lanes_min.to_le_bytes());
-        k[4..].copy_from_slice(&self.lanes_max.to_le_bytes());
+        k[4..8].copy_from_slice(&self.lanes_max.to_le_bytes());
+        k[8] = u8::from(self.first_lane_own);
         k
+    }
+
+    /// This target, for the translation that leaves a mesh shader's first
+    /// lane reads to the lanes' own values (see [`Target::first_lane_own`]).
+    pub fn with_first_lane_own(self) -> Target {
+        Target {
+            first_lane_own: true,
+            ..self
+        }
     }
 }
 
@@ -1074,10 +1092,12 @@ mod tests {
     const NVIDIA: Target = Target {
         lanes_min: 32,
         lanes_max: 32,
+        ..Target::ANY
     };
     const RDNA: Target = Target {
         lanes_min: 32,
         lanes_max: 64,
+        ..Target::ANY
     };
 
     #[test]
