@@ -92,6 +92,8 @@ pub mod host;
 mod lds_tests;
 #[cfg(all(test, windows))]
 mod lane_read_loop_tests;
+#[cfg(all(test, windows))]
+mod wave64_halves_tests;
 mod lower;
 mod rectangle;
 #[cfg(test)]

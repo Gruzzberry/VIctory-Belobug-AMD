@@ -1,10 +1,17 @@
 # Console wave64 compute on 32-lane hosts
 
-Status: steps 1, 2, 4 and 5 are in. On NVIDIA, wave64 programs whose lanes
-read only their own half run as two 32-lane waves. Groups of one console
-wave also run in the console flow: masks read whole, lanes of the other
-half, divergent branches and loops. Still open: groups of several console
-waves, LDS, whole-wave sections and `ds_(b)permute`.
+Status: steps 1, 2, 4 and 5 are in, and one console wave per group also
+shares LDS and runs whole-wave sections. On NVIDIA, wave64 programs whose
+lanes read only their own half run as two 32-lane waves. Groups of one
+console wave also run in the console flow: masks read whole, lanes of the
+other half, divergent branches and loops, LDS (a group barrier before each
+access that can meet another lane's, since the console compiler leaves them
+out inside one wave) and whole-wave sections (each half reduces its 32
+lanes, the halves exchange and combine; prefix sums add the lower half's
+total in the upper half). Of the title's shaders on a 32-lane host, 45
+compute programs still do not translate: groups of 128 to 1024 threads
+that read lanes (they need per-wave arrival counters) and one
+`ds_(b)permute`.
 
 ## The problem
 
@@ -113,8 +120,7 @@ does (step 5, `lower::CONSOLE_FLOW`):
 `lower` tries the per-lane form first. A program that needs the console
 flow stops with `CONSOLE_FLOW`, and `emit` lowers it again from the
 console structure. Eligible: wave64 compute on a host without 64-lane
-waves, at most 64 threads per group, no LDS, no `ds_(b)permute`, and no
-whole-wave sections.
+waves, at most 64 threads per group and no `ds_(b)permute`.
 
 Groups of several console waves still need another meeting point: a group
 barrier would wait for console waves elsewhere. The plan stays per-console-

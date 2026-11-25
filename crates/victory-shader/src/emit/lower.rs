@@ -519,6 +519,10 @@ struct Lower<'a> {
     split: bool,
     /// Split, and run as the console runs it ([`CONSOLE_FLOW`]).
     console_cf: bool,
+    /// Console flow of a group of one console wave on two host waves that
+    /// shares LDS: a group barrier stands before each LDS access that may
+    /// pair with a lane of the other half's.
+    lds_sync: bool,
     /// Split without [`Self::console_cf`] cannot run it, the console flow can.
     wants_console_flow: bool,
     /// The console thread's flat id in the group (relabelled; see
@@ -1111,6 +1115,7 @@ impl<'a> Lower<'a> {
         let mut console_lanes = false;
         let mut split = false;
         let mut wants_console_flow = false;
+        let mut lds_sync = false;
         if let StageIo::Cs(cs) = x.native.io {
             s.threads = Some(cs.threads);
             s.lds_dwords = cs.lds_bytes() / 4;
@@ -1193,15 +1198,13 @@ impl<'a> Lower<'a> {
             // The rest of such programs need the halves to exchange values
             // (masks read whole, lanes of the other half): the console flow,
             // for a group of one console wave without LDS.
-            wants_console_flow = console_lanes
+            wants_console_flow = (console_lanes || s.lds_dwords > 0)
                 && !split
                 && x.native.wave64
                 && !x.target.runs(64)
                 && x.target.runs(32)
-                && s.lds_dwords == 0
                 && cs.threads.iter().product::<u32>() <= 64
-                && !insts().any(|i| i.name().contains("permute"))
-                && (0..p.blocks.len()).all(|b| super::wave::sections(p, b).is_empty());
+                && !insts().any(|i| i.name().contains("permute"));
             // On a host that runs the console's wave size: lane reads and
             // writes in a program whose lanes branch differently (see
             // [`CONSOLE_FLOW`]).
@@ -1223,6 +1226,11 @@ impl<'a> Lower<'a> {
                 console_lanes = true;
                 // In halves only where the host cannot run the console wave.
                 split = x.native.wave64 && !x.target.runs(64);
+                // The console compiler leaves out the barriers between the
+                // lanes of one wave that share LDS, since a wave runs in
+                // order; the halves are two host waves, so those meet at
+                // barriers the lowering adds (see `Lower::lds_barrier`).
+                lds_sync = split && s.lds_dwords > 0 && cs.threads.iter().product::<u32>() > 32;
             }
             if split {
                 s.wave_size = Some(32);
@@ -1316,6 +1324,7 @@ impl<'a> Lower<'a> {
             numeric_selects,
             split,
             console_cf: x.console_cf,
+            lds_sync,
             wants_console_flow,
             console_flat: None,
             xchg: None,
@@ -1847,7 +1856,10 @@ impl<'a> Lower<'a> {
         if self.mask_data == MaskData::None {
             return Err("a wave reduction in a mesh shader");
         }
-        if self.split {
+        // In halves, a wave operation covers the host wave's 32 lanes; the
+        // console flow exchanges the halves' results (see `join_halves`).
+        let halves = self.split && self.s.threads.expect("compute").iter().product::<u32>() > 32;
+        if self.split && !self.console_cf {
             return Err("a wave reduction in a wave64 program split in halves");
         }
         let c = self.cur;
@@ -1886,6 +1898,29 @@ impl<'a> Lower<'a> {
                     121,
                     &[arg, k0, k1],
                 );
+                // The upper half's lanes also sum the lower half's.
+                let r = if halves {
+                    let (k0, u) = (self.s.m.i8(0), self.s.m.i8(u8::from(!float)));
+                    let total = self.s.op(
+                        c,
+                        &format!("waveActiveOp.{sfx}"),
+                        Attr::NoUnwind,
+                        ty,
+                        119,
+                        &[arg, k0, u],
+                    );
+                    let total = if float { self.as_int(total) } else { total };
+                    let (lo, _) = self.exchange(c, total);
+                    let lo = if float { self.as_float(lo) } else { lo };
+                    let (_, half) = self.console_lane();
+                    let zero = self.s.m.i32(0);
+                    let upper = self.s.m.cmp(c, pred::NE, half, zero);
+                    let none = if float { self.as_float(zero) } else { zero };
+                    let add = self.s.m.select(c, upper, lo, none);
+                    self.s.m.bin(c, Bin::Add, r, add)
+                } else {
+                    r
+                };
                 if inclusive {
                     self.s.m.bin(c, Bin::Add, r, arg)
                 } else {
@@ -1922,6 +1957,11 @@ impl<'a> Lower<'a> {
                 )
             }
         };
+        let r = if halves && prefix.is_none() {
+            self.join_halves(op, r, float)
+        } else {
+            r
+        };
         Ok(if f16 {
             self.s
                 .op(c, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[r])
@@ -1930,6 +1970,40 @@ impl<'a> Lower<'a> {
         } else {
             r
         })
+    }
+
+    /// Console flow in halves: the whole-wave reduction `r` of this half's
+    /// 32 lanes (uniform in the half) joined with the other half's, which
+    /// the halves exchange. `float`: `r` is a float.
+    fn join_halves(&mut self, op: super::wave::Op, r: V, float: bool) -> V {
+        use super::wave::Op;
+        let c = self.cur;
+        let bits = if float { self.as_int(r) } else { r };
+        let (lo, hi) = self.exchange(c, bits);
+        let (a, b) = if float {
+            (self.as_float(lo), self.as_float(hi))
+        } else {
+            (lo, hi)
+        };
+        let m = &mut self.s.m;
+        match op {
+            Op::AddU => m.bin(c, Bin::Add, a, b),
+            Op::AddF | Op::AddF16 => m.bin(c, Bin::Add, a, b),
+            Op::Or => m.bin(c, Bin::Or, a, b),
+            Op::And => m.bin(c, Bin::And, a, b),
+            Op::Xor => m.bin(c, Bin::Xor, a, b),
+            Op::MinU | Op::MaxU | Op::MinI | Op::MaxI => {
+                let p = match op {
+                    Op::MinU => pred::IULT,
+                    Op::MaxU => pred::IUGT,
+                    Op::MinI => pred::SLT,
+                    _ => pred::SGT,
+                };
+                let t = m.cmp(c, p, a, b);
+                m.select(c, t, a, b)
+            }
+            Op::MinF | Op::MaxF => self.max_min(op == Op::MaxF, a, b),
+        }
     }
 
     fn run(mut self) -> Result<Lowered, Stop> {
@@ -4595,6 +4669,31 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
+    /// Console flow, two halves sharing LDS: a group barrier (with the
+    /// group-shared fence) before an LDS access, unless the one before it in
+    /// the block was a read and this is a read too. Every thread of the
+    /// group reaches it: its halves take every branch together.
+    fn lds_barrier(&mut self, inst: &Inst, b: usize, i: usize) {
+        let reads = |n: &str| n.starts_with("ds_read");
+        let lds = |n: &str| {
+            n.starts_with("ds_")
+                && !n.starts_with("ds_swizzle")
+                && !n.contains("permute")
+                && n != "ds_nop"
+        };
+        let before = self.x.p.blocks[b].insts[..i]
+            .iter()
+            .rev()
+            .map(|j| j.name())
+            .find(|n| lds(n) || *n == "s_barrier");
+        if reads(inst.name()) && before.is_some_and(reads) {
+            return;
+        }
+        let (mode, void) = (self.s.m.i32(1 | 8), self.s.t.void);
+        self.s
+            .op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+    }
+
     /// LDS (thread-group shared memory) and `ds_swizzle`.
     fn ds(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
         let Fields::Ds {
@@ -4693,6 +4792,9 @@ impl<'a> Lower<'a> {
         }
         if self.s.lds_dwords == 0 {
             return Err("LDS the program does not allocate");
+        }
+        if self.lds_sync {
+            self.lds_barrier(inst, b, i);
         }
         if name.contains("addtid") {
             return Err("an LDS address based on the console lane ID and M0");
