@@ -511,9 +511,6 @@ const PORTABLE_VIEWS: u32 = 1_000_000;
 /// subsurface resolve, tree imposters). `victory_shader::emit::VIEW_SLOTS`
 /// is the title's 1,245,184 slots, these and those of [`crate::memory`].
 const DYNAMIC: u32 = 1 << 20;
-/// Smaller dynamic reserve when the host caps the whole view heap at
-/// [`PORTABLE_VIEWS`].
-const DYNAMIC_CAPPED: u32 = 1 << 16;
 
 /// The host's limit for shader-visible sampler heaps, on every binding
 /// tier.
@@ -525,6 +522,39 @@ const SAMPLERS: u32 = D3D12_MAX_SHADER_VISIBLE_SAMPLER_HEAP_SIZE;
 fn view_slots(count: u32) -> u32 {
     let slots = count + crate::memory::SLOTS;
     if cfg!(test) { slots } else { slots.max(victory_shader::emit::VIEW_SLOTS) }
+}
+
+/// The fewest dynamic slots a view heap capped by the host keeps. A world
+/// frame holds some 400,000 slots of tables; 2^18 serves most draws, and the
+/// title slots it takes from are mostly tables' (made afresh by
+/// `draw::tables`), not directly indexed.
+const DYNAMIC_FLOOR: u32 = 1 << 18;
+
+/// The largest shader-visible view heap the host makes, at most `wanted`
+/// slots (a size known to fail): [`PORTABLE_VIEWS`] is taken as made, the
+/// rest found by halving the span. `makes(n)` tries a heap of `n` slots.
+fn probe_view_limit(wanted: u32, mut makes: impl FnMut(u32) -> bool) -> u32 {
+    let (mut ok, mut bad) = (PORTABLE_VIEWS, wanted);
+    while bad.saturating_sub(ok) > 1024 {
+        let mid = ok + (bad - ok) / 2;
+        if makes(mid) {
+            ok = mid;
+        } else {
+            bad = mid;
+        }
+    }
+    ok
+}
+
+/// Title slots and dynamic slots of a view heap of `limit` slots in all,
+/// `memory` of them [`crate::memory`]'s, for a title of `wanted` slots that
+/// does not fit with [`DYNAMIC`] after it: dynamic slots are what is left
+/// after the title, but at least [`DYNAMIC_FLOOR`], and the title keeps the
+/// rest.
+fn capped_layout(wanted: u32, limit: u32, memory: u32) -> (u32, u32) {
+    let room = limit.saturating_sub(memory);
+    let spare = room.saturating_sub(wanted).clamp(DYNAMIC_FLOOR, DYNAMIC).min(room);
+    (wanted.min(room - spare), spare)
 }
 
 /// Dynamic slots of a sampler heap capped at [`SAMPLERS`], for tables
@@ -583,20 +613,25 @@ impl HostHeap {
         let (heap, count, extra) = match make(count + extra) {
             Ok(heap) => (heap, count, extra),
             Err(e) if !sampler && count + extra + crate::memory::SLOTS > PORTABLE_VIEWS => {
-                // shortcut: descriptors past the host's limit are left out;
-                // draw::tables now remaps the root tables that reach them.
+                // The host takes fewer views in a shader-visible heap than
+                // the title's, its dynamic slots and memory's together
+                // (1,000,000 on tier 1 and 2 hardware; some tier 3 hardware
+                // takes more than that, and less than we asked). Find what
+                // it takes, then keep the dynamic slots tables need and let
+                // title slots past them go: draw::tables makes the tables
+                // reaching those afresh.
+                let limit = probe_view_limit(count + extra + crate::memory::SLOTS, |n| create(n).is_ok());
+                let (title, spare) = capped_layout(count, limit, crate::memory::SLOTS);
                 tracing::warn!(
                     error = %e,
                     wanted,
-                    made = PORTABLE_VIEWS - DYNAMIC_CAPPED,
-                    lost = wanted + DYNAMIC_CAPPED - PORTABLE_VIEWS,
-                    "host view heap capped at {PORTABLE_VIEWS}"
+                    limit,
+                    made = title,
+                    lost = wanted - title,
+                    dynamic = spare,
+                    "host view heap capped at {limit}"
                 );
-                (
-                    make(PORTABLE_VIEWS - crate::memory::SLOTS).ok()?,
-                    PORTABLE_VIEWS - DYNAMIC_CAPPED - crate::memory::SLOTS,
-                    DYNAMIC_CAPPED,
-                )
+                (make(title + spare).ok()?, title, spare)
             }
             Err(e) => {
                 tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
@@ -2813,6 +2848,39 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn capped_layout_fits_the_limit() {
+        let mem = crate::memory::SLOTS;
+        // NVIDIA's 1,000,000 against the title's 1,245,184: the title
+        // gives way to the dynamic floor, and everything is inside.
+        let (title, spare) = capped_layout(1_245_184, 1_000_000, mem);
+        assert_eq!(spare, DYNAMIC_FLOOR);
+        assert_eq!(title + spare + mem, 1_000_000);
+        // A host taking a little more than the title: dynamic is what is
+        // left, but not under the floor.
+        let (title, spare) = capped_layout(1_245_184, 1_300_000, mem);
+        assert_eq!(spare, DYNAMIC_FLOOR);
+        assert_eq!(title + spare + mem, 1_300_000);
+        // Room for the title and a good deal more: the title is whole.
+        let (title, spare) = capped_layout(1_245_184, 1_800_000, mem);
+        assert_eq!((title, spare), (1_245_184, 1_800_000 - mem - 1_245_184));
+        // Never past the limit, however small.
+        for limit in [0, 100, 1_024, 5_000, 300_000, 1_000_000, 3_000_000] {
+            let (title, spare) = capped_layout(1_245_184, limit, mem);
+            assert!(title + spare + mem.min(limit) <= limit.max(mem), "{limit}");
+        }
+    }
+
+    #[test]
+    fn view_limit_probe_finds_the_host_maximum() {
+        for max in [1_000_000, 1_000_500, 1_234_567, 2_000_000] {
+            let found = probe_view_limit(2_294_784 + 1_048_576, |n| n <= max);
+            assert!(found <= max && max - found <= 1024, "{max} {found}");
+        }
+        // A host past the wanted size is not asked for more.
+        assert!(probe_view_limit(1_100_000, |n| n <= 5_000_000) >= 1_100_000 - 1024);
+    }
+
     use super::*;
     use crate::descriptor::{
         HeapDesc, copy_simple, create_cbv, create_heap, create_placed_srv, create_srv, create_uav,

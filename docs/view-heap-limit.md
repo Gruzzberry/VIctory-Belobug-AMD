@@ -1,4 +1,4 @@
-# The host's view heap limit
+﻿# The host's view heap limit
 
 The console's descriptor heaps have no 1,000,000-entry ceiling. The host's
 do: `D3D12_MAX_SHADER_VISIBLE_DESCRIPTOR_HEAP_SIZE_TIER_1` and `_TIER_2`
@@ -6,8 +6,7 @@ are 1,000,000 views, and `D3D12_MAX_SHADER_VISIBLE_SAMPLER_HEAP_SIZE` is
 2,048 samplers on every tier. NVIDIA reports tier 2, so a title heap larger
 than that cannot exist on the host as one heap.
 
-`descriptor::host::HostHeap::new` creates the largest heap it can and keeps
-`PORTABLE_VIEWS - DYNAMIC` of the title's slots. A sampler heap over 2,048
+`descriptor::host::HostHeap::new` creates the largest heap it can: when the\nfull size fails it probes the host's real maximum (`probe_view_limit`, from\n1,000,000 up) and lays the heap out with `capped_layout`: at least\n`DYNAMIC_FLOOR` (2^18) dynamic slots, the title's slots in what is left.\nTitle slots past that are served by tables made afresh in the dynamic area. A sampler heap over 2,048
 fails outright and `new` returns `None`, losing the heap entirely.
 
 Reported as a device hang on the first-boot screens (#11, RTX 4060) and a
@@ -81,3 +80,4 @@ tier-2 NVIDIA host to be seen live; it is a static change on this machine.
 2. Remap root tables past the cap (#21, landed).
 3. Decide what to do with directly indexed heaps past the cap.
 4. Handle the sampler heap's 2,048 limit without losing the heap.
+
