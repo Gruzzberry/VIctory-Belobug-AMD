@@ -551,6 +551,51 @@ impl HostPipeline {
                     &name,
                 ),
             };
+            let made = match made {
+                Err(e) => {
+                    // The driver refused the mesh shader (offline it runs out of
+                    // memory, E_OUTOFMEMORY, on some with a wave read among
+                    // their address arithmetic; the game saw E_FAIL): it takes
+                    // the lanes' own values instead.
+                    let alt = stages[0].0.translated_without_first_lane_reads();
+                    match alt {
+                        Some(alt) => {
+                            let ms_code = D3D12_SHADER_BYTECODE {
+                                pShaderBytecode: alt.dxil.as_ptr().cast(),
+                                BytecodeLength: alt.dxil.len(),
+                            };
+                            let name = super::library::name(
+                                "mesh",
+                                &root_blob,
+                                &[&code_bytes(&ms_code), &code_bytes(&code(1))],
+                                &state,
+                            );
+                            let ms = Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, ms_code);
+                            let retry = match depth_with_bounds {
+                                Some(depth) => stream_pipeline(
+                                    &host.device, &root, ms, code(1), g,
+                                    Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1, depth),
+                                    &name,
+                                ),
+                                None => stream_pipeline(
+                                    &host.device, &root, ms, code(1), g,
+                                    Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL, g.depth),
+                                    &name,
+                                ),
+                            };
+                            if retry.is_ok() {
+                                tracing::info!(
+                                    ?shaders,
+                                    "host mesh pipeline made with the lanes' own first-lane reads (the driver ran out of memory otherwise)"
+                                );
+                            }
+                            retry
+                        }
+                        None => Err(e),
+                    }
+                }
+                made => made,
+            };
             let pso = match made {
                 Ok(pso) => pso,
                 Err(e) => {

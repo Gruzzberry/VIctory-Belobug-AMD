@@ -381,10 +381,12 @@ mod tests {
         let nvidia = Target {
             lanes_min: 32,
             lanes_max: 32,
+            ..Target::ANY
         };
         let rdna = Target {
             lanes_min: 32,
             lanes_max: 64,
+            ..Target::ANY
         };
         assert_eq!(key(&build, nvidia), key(&build, nvidia));
         assert_ne!(key(&build, nvidia), key(&build, rdna));

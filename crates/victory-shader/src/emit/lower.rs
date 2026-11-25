@@ -8289,6 +8289,11 @@ impl<'a> Lower<'a> {
                 let r = self.console_read_lane(a, first);
                 int(self, r)
             }
+            "v_readfirstlane_b32" if self.s.mesh.is_some() && self.x.target.first_lane_own => {
+                // The retranslation of a mesh shader the driver refused.
+                let a = s(self, 0)?;
+                int(self, a)
+            }
             "v_readfirstlane_b32" => {
                 let a = s(self, 0)?;
                 self.s.flags |= flags::WAVE_OPS;
@@ -13219,6 +13224,71 @@ mod tests {
             console_cf: false,
             per_lane_only: false,
         })
+    }
+
+    /// Lowers a mesh program (128 lanes, wave64, 128 vertices and
+    /// primitives) for `target`.
+    fn lower_mesh(
+        words: &[u32],
+        target: super::super::Target,
+    ) -> Result<Lowered, crate::ShaderError> {
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let native = NativeProgram {
+            stage: HwStage::Ms,
+            wave64: true,
+            vgprs: 256,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Ms(crate::native::MeshIo {
+                outputs: vec![],
+                clip_cntl: 0,
+                threads: 128,
+                max_vertices: 128,
+                max_primitives: 128,
+                topology: 2,
+                lds_bytes: 0,
+            }),
+            code,
+        };
+        let p = ir::build(&native.code, true, 256).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage)?;
+        let io = io::raise(&p, &native)?;
+        let st = structure::structure(&p).unwrap();
+        lower(&Parts {
+            psv: None,
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs: vec![],
+            prims: vec![],
+            mesh_stride: 128,
+            target,
+            console_cf: false,
+            per_lane_only: false,
+        })
+    }
+
+    /// A mesh shader's `v_readfirstlane_b32` of a computed value is a wave
+    /// read, unless the target leaves it to the lanes' own values (the
+    /// retranslation for an NVIDIA driver that ran out of memory making the
+    /// pipeline).
+    #[test]
+    fn mesh_first_lane_reads_can_be_the_lanes_own() {
+        let words = [
+            0x4A0C_0081, // v_add_nc_u32 v6, 1, v0
+            0x7E04_0506, // v_readfirstlane_b32 s2, v6
+            0x7E0E_0202, // v_mov_b32 v7, s2
+            0xF800_0941,
+            0x0000_0007, // exp prim, v7, off, off, off done
+            S_ENDPGM,
+        ];
+        let usual = lower_mesh(&words, super::super::Target::ANY).unwrap();
+        assert!(usual.wave_ops, "the usual translation reads the first lane");
+        let own = lower_mesh(&words, super::super::Target::ANY.with_first_lane_own()).unwrap();
+        assert!(!own.wave_ops, "the retranslation keeps no wave read");
     }
 
     /// Root parameter `slot` in user SGPRs from `user_data` on.

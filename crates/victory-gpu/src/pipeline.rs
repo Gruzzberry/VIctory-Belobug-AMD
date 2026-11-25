@@ -210,6 +210,21 @@ pub(crate) struct Translated {
 
 #[cfg(windows)]
 impl Shader {
+    /// The mesh shader's translation with its first-lane reads left to the
+    /// lanes' own values (`Target::first_lane_own`), for a host whose driver
+    /// ran out of memory making a pipeline of the usual one. `None` when it
+    /// makes no difference (no such read) or does not translate.
+    pub(crate) fn translated_without_first_lane_reads(
+        &self,
+    ) -> Option<victory_shader::emit::HostShader> {
+        let usual = self.translated()?;
+        let target = crate::host::host()
+            .map_or(victory_shader::emit::Target::ANY, |h| h.target())
+            .with_first_lane_own();
+        let alt = crate::shader_cache::host_shader(&self.container, target).ok()?;
+        (alt.dxil != usual.host.dxil).then_some(alt)
+    }
+
     /// The translation, made on first use; a shader that does not
     /// translate is logged once.
     pub(crate) fn translated(&self) -> Option<&Translated> {
