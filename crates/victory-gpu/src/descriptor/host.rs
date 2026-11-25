@@ -512,8 +512,24 @@ const PORTABLE_VIEWS: u32 = 1_000_000;
 /// is the title's 1,245,184 slots, these and those of [`crate::memory`].
 const DYNAMIC: u32 = 1 << 20;
 /// Smaller dynamic reserve when the host caps the whole view heap at
-/// [`PORTABLE_VIEWS`].
-const DYNAMIC_CAPPED: u32 = 1 << 16;
+/// [`PORTABLE_VIEWS`]. A world frame wants some 400,000 and 2^16 ran out on
+/// an RTX 4070 (base run: "no free dynamic descriptor slots", then tables
+/// fell back to title slots past the heap, whose views are null, and 120
+/// dispatches writing through them were dropped); 2^18 leaves 737,000
+/// title slots, and tables reaching past those are made afresh.
+/// `VICTORY_DYNAMIC_CAPPED=<slots>` sets it.
+const DYNAMIC_CAPPED: u32 = 1 << 18;
+
+/// The dynamic slots of a capped view heap: [`DYNAMIC_CAPPED`], or what
+/// `VICTORY_DYNAMIC_CAPPED` names (kept between 2^12 and half the heap).
+fn capped_dynamic() -> u32 {
+    let asked = std::env::var("VICTORY_DYNAMIC_CAPPED").ok().and_then(|v| v.parse::<u32>().ok());
+    clamp_dynamic(asked.unwrap_or(DYNAMIC_CAPPED))
+}
+
+fn clamp_dynamic(n: u32) -> u32 {
+    n.clamp(1 << 12, PORTABLE_VIEWS / 2)
+}
 
 /// The host's limit for shader-visible sampler heaps, on every binding
 /// tier.
@@ -580,6 +596,7 @@ impl HostHeap {
         }
         let extra = if sampler { 0 } else { DYNAMIC };
         let wanted = count;
+        let capped = capped_dynamic();
         let (heap, count, extra) = match make(count + extra) {
             Ok(heap) => (heap, count, extra),
             Err(e) if !sampler && count + extra + crate::memory::SLOTS > PORTABLE_VIEWS => {
@@ -588,14 +605,14 @@ impl HostHeap {
                 tracing::warn!(
                     error = %e,
                     wanted,
-                    made = PORTABLE_VIEWS - DYNAMIC_CAPPED,
-                    lost = wanted + DYNAMIC_CAPPED - PORTABLE_VIEWS,
+                    made = PORTABLE_VIEWS - capped,
+                    lost = (wanted + capped).saturating_sub(PORTABLE_VIEWS),
                     "host view heap capped at {PORTABLE_VIEWS}"
                 );
                 (
                     make(PORTABLE_VIEWS - crate::memory::SLOTS).ok()?,
-                    PORTABLE_VIEWS - DYNAMIC_CAPPED - crate::memory::SLOTS,
-                    DYNAMIC_CAPPED,
+                    PORTABLE_VIEWS - capped - crate::memory::SLOTS,
+                    capped,
                 )
             }
             Err(e) => {
@@ -2822,6 +2839,16 @@ mod tests {
     use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
     use windows::Win32::Graphics::Direct3D::ID3DBlob;
     use windows::core::s;
+
+    #[test]
+    fn capped_dynamic_reserve_is_large_and_bounded() {
+        assert!(DYNAMIC_CAPPED >= 1 << 18);
+        assert_eq!(clamp_dynamic(0), 1 << 12);
+        assert_eq!(clamp_dynamic(u32::MAX), PORTABLE_VIEWS / 2);
+        // Title slots, dynamic ones and memory's fit the host's limit.
+        let title = PORTABLE_VIEWS - DYNAMIC_CAPPED - crate::memory::SLOTS;
+        assert_eq!(title + DYNAMIC_CAPPED + crate::memory::SLOTS, PORTABLE_VIEWS);
+    }
 
     const HEAP_IID: Iid = guid(
         0x8efb471d,
