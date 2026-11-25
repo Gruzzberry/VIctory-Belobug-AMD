@@ -780,6 +780,10 @@ fn log_gpu_waits() {
 /// (kind and pipeline), and the frames presented meanwhile.
 #[cfg(feature = "diagnostics")]
 static GPU_TIMES: Mutex<Option<std::collections::HashMap<String, (u32, f64)>>> = Mutex::new(None);
+/// Frames presented since the last copystat line (its counters are logged
+/// every 5 s, not with each frame-rate line).
+#[cfg(feature = "diagnostics")]
+static COPYSTAT_FRAMES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 #[cfg(feature = "diagnostics")]
 static TIMED_FRAMES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
@@ -2557,8 +2561,37 @@ impl HostList {
         let mut refresh_count = 0u64;
         #[cfg(feature = "diagnostics")]
         let mut refresh_bytes = 0u64;
-        for step in &deferred.copies {
+        let steps = &deferred.copies;
+        let mut at = 0;
+        while at < steps.len() {
+            let step = &steps[at];
+            at += 1;
             match step {
+                &Step::Fill(dst, src, len) if fill_workers() > 1 && fills_following(steps, at) > 0 => {
+                    // A run of fills: independent copies from title memory
+                    // into upload memory, done on several threads.
+                    let more = fills_following(steps, at);
+                    let mut group = vec![(dst, src, len)];
+                    group.extend(steps[at..at + more].iter().filter_map(|s| match s {
+                        &Step::Fill(d, s, l) => Some((d, s, l)),
+                        _ => None,
+                    }));
+                    at += more;
+                    let started = std::time::Instant::now();
+                    let bytes: u64 = group.iter().map(|g| g.2 as u64).sum();
+                    let threaded = copy_fills(&group);
+                    copy_us += started.elapsed().as_micros() as u64;
+                    copy_bytes += bytes;
+                    #[cfg(feature = "diagnostics")]
+                    {
+                        copy_count += group.len() as u64;
+                        add(C::Fills, group.len() as u64);
+                        add(C::FillUs, started.elapsed().as_micros() as u64);
+                        add(C::FillBytes, bytes);
+                        add(C::FillGroups, u64::from(threaded));
+                    }
+                    let _ = threaded;
+                }
                 &Step::Copy(dst, src, len) => {
                     #[cfg(feature = "diagnostics")]
                     {
@@ -2579,6 +2612,12 @@ impl HostList {
                     copy_mapped(dst as *mut u8, src as *const u8, len, false);
                     copy_us += started.elapsed().as_micros() as u64;
                     copy_bytes += len as u64;
+                    #[cfg(feature = "diagnostics")]
+                    {
+                        add(C::Fills, 1);
+                        add(C::FillUs, started.elapsed().as_micros() as u64);
+                        add(C::FillBytes, len as u64);
+                    }
                 }
                 Step::Refresh(shadow, address, len) => {
                     #[cfg(feature = "diagnostics")]
@@ -2904,6 +2943,80 @@ fn update(shadow: &crate::shadow::Shadow, from: usize, len: usize) {
     crate::copystat::range(from, len, us, 0);
     PREPARING[0].fetch_add(us, Ordering::Relaxed);
     PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
+}
+
+/// Threads copying a run of fills (`VICTORY_FILL_WORKERS`, 1 for serial;
+/// default 4, fewer on a machine with fewer cores).
+fn fill_workers() -> usize {
+    static N: OnceLock<usize> = OnceLock::new();
+    *N.get_or_init(|| {
+        let cores = std::thread::available_parallelism().map_or(1, usize::from);
+        std::env::var("VICTORY_FILL_WORKERS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or_else(|| cores.saturating_sub(2).clamp(1, 4))
+    })
+}
+
+/// How many `Step::Fill`s follow `steps[from - 1]` without anything between.
+fn fills_following(steps: &[Step], from: usize) -> usize {
+    steps[from.min(steps.len())..]
+        .iter()
+        .take_while(|s| matches!(s, Step::Fill(..)))
+        .count()
+}
+
+/// Fills smaller than this in all are copied on the calling thread: handing
+/// work to other threads costs about as much.
+const FILL_THREADED_MIN: usize = 1 << 20;
+/// Fills larger than this are cut into pieces of it for the workers.
+const FILL_PIECE: usize = 1 << 20;
+
+/// Cuts fills into pieces of at most `piece` bytes, each (destination,
+/// source, bytes).
+fn fill_pieces(fills: &[(usize, usize, usize)], piece: usize) -> Vec<(usize, usize, usize)> {
+    let mut out = Vec::with_capacity(fills.len());
+    for &(dst, src, len) in fills {
+        let mut done = 0;
+        while done < len {
+            let n = (len - done).min(piece);
+            out.push((dst + done, src + done, n));
+            done += n;
+        }
+    }
+    out
+}
+
+/// Copies title memory into upload memory for each of `fills` (destination,
+/// source, bytes: none overlap in the destination), on several threads when
+/// they total enough. Returns whether threads were used.
+fn copy_fills(fills: &[(usize, usize, usize)]) -> bool {
+    let total: usize = fills.iter().map(|f| f.2).sum();
+    let workers = fill_workers();
+    if workers <= 1 || total < FILL_THREADED_MIN {
+        for &(dst, src, len) in fills {
+            copy_mapped(dst as *mut u8, src as *const u8, len, false);
+        }
+        return false;
+    }
+    let pieces = fill_pieces(fills, FILL_PIECE);
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let work = || {
+        loop {
+            let i = next.fetch_add(1, Ordering::Relaxed);
+            let Some(&(dst, src, len)) = pieces.get(i) else {
+                return;
+            };
+            copy_mapped(dst as *mut u8, src as *const u8, len, false);
+        }
+    };
+    std::thread::scope(|scope| {
+        for _ in 1..workers.min(pieces.len()) {
+            scope.spawn(work);
+        }
+        work();
+    });
+    true
 }
 
 /// Copies title memory at submission. The ranges were checked against their
@@ -3383,6 +3496,8 @@ impl Meter {
         self.frames += 1;
         #[cfg(feature = "diagnostics")]
         TIMED_FRAMES.fetch_add(1, Ordering::Relaxed);
+        #[cfg(feature = "diagnostics")]
+        COPYSTAT_FRAMES.fetch_add(1, Ordering::Relaxed);
         let elapsed = self.since.elapsed();
         if elapsed < std::time::Duration::from_secs(1) {
             return;
@@ -3440,7 +3555,7 @@ impl Meter {
                     "textures changed in place"
                 );
                 crate::texture::flips::log();
-                crate::copystat::log(frames);
+                crate::copystat::log(f64::from(COPYSTAT_FRAMES.swap(0, Ordering::Relaxed)).max(1.0));
                 for (why, n) in drops.iter().take(40) {
                     tracing::info!(
                         "dropped {:.1}/frame without a host pipeline: {why}",
@@ -4245,4 +4360,50 @@ fn wait_if_removed(device: &ID3D12Device, error: &windows::core::Error) {
         tracing::error!(?reason, layer = ?host().and_then(|h| h.log_messages()), "host GPU device gone");
     });
     std::thread::sleep(std::time::Duration::from_secs(20));
+}
+
+#[cfg(test)]
+mod fill_tests {
+    use super::*;
+
+    fn fill(n: usize) -> Step {
+        Step::Fill(n, n, 1)
+    }
+
+    #[test]
+    fn counts_the_fills_after_a_step() {
+        let steps = vec![fill(0), fill(1), fill(2), Step::Host(Box::new(|| {})), fill(3)];
+        assert_eq!(fills_following(&steps, 1), 2);
+        assert_eq!(fills_following(&steps, 3), 0);
+        assert_eq!(fills_following(&steps, 4), 1);
+        assert_eq!(fills_following(&steps, 5), 0);
+        assert_eq!(fills_following(&steps, 99), 0);
+    }
+
+    #[test]
+    fn pieces_cover_each_fill_once() {
+        let fills = [(1000, 5000, 10), (2000, 6000, 25), (3000, 7000, 0)];
+        let pieces = fill_pieces(&fills, 10);
+        assert_eq!(pieces, [(1000, 5000, 10), (2000, 6000, 10), (2010, 6010, 10), (2020, 6020, 5)]);
+    }
+
+    #[test]
+    fn threaded_fills_copy_what_a_serial_copy_does() {
+        // Several fills, some bigger than a piece, in one buffer each way.
+        let sizes = [300_000usize, 2_500_000, 1, 4_096, 1_100_000, 777_777];
+        let total: usize = sizes.iter().sum();
+        let src: Vec<u8> = (0..total).map(|i| (i.wrapping_mul(31) >> 3) as u8).collect();
+        let mut dst = vec![0u8; total];
+        let mut at = 0;
+        let fills: Vec<_> = sizes
+            .iter()
+            .map(|&n| {
+                let f = (dst.as_mut_ptr() as usize + at, src.as_ptr() as usize + at, n);
+                at += n;
+                f
+            })
+            .collect();
+        assert!(copy_fills(&fills) || fill_workers() <= 1);
+        assert!(dst == src);
+    }
 }

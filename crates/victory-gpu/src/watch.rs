@@ -182,6 +182,8 @@ pub(crate) fn writes_guarded(start: usize, end: usize) -> Option<(u64, Vec<(usiz
         use crate::copystat::{C, add};
         add(C::Watches, 1);
         add(C::WatchUs, started.elapsed().as_micros() as u64);
+        add(C::GuardAsks, 1);
+        add(C::GuardUs, started.elapsed().as_micros() as u64);
     }
     j.asked += 1;
     let now = j.asked;
