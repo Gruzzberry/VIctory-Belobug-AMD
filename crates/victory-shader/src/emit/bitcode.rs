@@ -169,6 +169,8 @@ pub(crate) enum Term {
 
 #[derive(Debug, Clone, Default)]
 struct Block {
+    /// Code appended to this block goes to that one instead (see `Module::continue_in`).
+    onward: Option<usize>,
     phis: Vec<u32>,
     body: Vec<u32>,
     term: Option<Term>,
@@ -450,6 +452,7 @@ impl Module {
         let i = self.insts.len() as u32;
         self.insts.push(Inst { ty, op });
         // Terminators are kept apart, so a block can still grow at its end.
+        let block = self.resolve(block);
         self.blocks[block].body.push(i);
         V::Inst(i)
     }
@@ -540,7 +543,21 @@ impl Module {
         let V::Inst(i) = phi else { panic!() };
         self.insts[i as usize].op = Op::Phi(incoming);
     }
+    /// Where code for `block` goes: past the blocks code was moved on from.
+    fn resolve(&self, mut block: usize) -> usize {
+        while let Some(next) = self.blocks[block].onward {
+            block = next;
+        }
+        block
+    }
+    /// Code that goes on in `block` (made a wait loop's head, say) continues in
+    /// `to`: what a lowering that kept the block it started in appends later
+    /// lands in `to`, after what is already there.
+    pub fn continue_in(&mut self, block: usize, to: usize) {
+        self.blocks[block].onward = Some(to);
+    }
     pub fn terminate(&mut self, block: usize, t: Term) {
+        let block = self.resolve(block);
         self.blocks[block].term = Some(t);
     }
 

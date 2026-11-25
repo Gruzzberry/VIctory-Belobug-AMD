@@ -218,6 +218,10 @@ fn flow_case(label: &str, body: &[u32], threads: u32, want: impl Fn(u32) -> u32,
         let Ok(host) = Host::on(&name) else {
             continue;
         };
+        // Waves of 16 (an integrated GPU) run neither form.
+        if !host.target().runs(32) && !host.target().runs(64) {
+            continue;
+        }
         let p = program(body, threads);
         let split = !host.target().runs(64);
         let groups = 2;
@@ -284,21 +288,46 @@ fn exchanges_inside_a_branch_one_half_skips() {
     });
 }
 
-/// Groups of several console waves need the halves to meet without a
-/// group barrier: not yet.
+/// Groups of several console waves: the halves of one console wave meet
+/// through arrival flags, not a group barrier the other waves would have to
+/// reach. Lane t of console wave w sees that wave's lanes (v0 holds the
+/// group's thread id, so lane 40 of wave w holds 64 w + 40).
 #[test]
-fn console_flow_is_for_one_console_wave_per_group() {
+fn halves_of_several_console_waves_meet_through_flags() {
+    let nvidia = super::Target {
+        lanes_min: 32,
+        lanes_max: 32,
+    };
     let body = [
         0xD760_0009,
         0x0001_5100, // v_readlane_b32 s9, v0, 40
         0x7E04_0209, // v_mov_b32 v2, s9
     ];
-    let nvidia = super::Target {
-        lanes_min: 32,
-        lanes_max: 32,
-    };
-    assert!(emit_for(&program(&body, 64), nvidia).is_ok());
-    assert!(emit_for(&program(&body, 128), nvidia).is_err());
+    assert!(emit_for(&program(&body, 128), nvidia).is_ok());
+    for threads in [128, 256] {
+        console_flow_case("v_readlane 40", &body, threads, |t| t / 64 * 64 + 40);
+    }
+    let count = [
+        0x7D88_00A8, // v_cmp_gt_u32 vcc, 40, v0
+        0xBE89_106A, // s_bcnt1_i32_b64 s9, vcc
+        0x7E04_0209, // v_mov_b32 v2, s9
+    ];
+    // Wave 0 has lanes 0..40 below 40; the other waves' ids are all above.
+    console_flow_case("s_bcnt1 of ids below 40", &count, 128, |t| u32::from(t < 64) * 40);
+    // Two exchanges in a row, the second after a branch only some lanes take.
+    let branch = [
+        0x7E04_0281, // v_mov_b32 v2, 1
+        0x7D88_0094, // v_cmp_gt_u32 vcc, 20, v0
+        0xBE8A_246A, // s_and_saveexec_b64 s[10:11], vcc
+        0xBF88_0003, // s_cbranch_execz +3
+        0xD760_0009,
+        0x0001_1500, // v_readlane_b32 s9, v0, 10
+        0x7E04_0209, // v_mov_b32 v2, s9
+        0x88FE_0A7E, // s_or_b64 exec, exec, s[10:11]
+    ];
+    console_flow_case("if (id < 20) v2 = readlane(10)", &branch, 128, |t| {
+        if t < 20 { 10 } else { 1 }
+    });
 }
 
 /// A loop lane t runs t times, with a lane read of the other half in

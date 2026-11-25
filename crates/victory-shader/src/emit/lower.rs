@@ -530,6 +530,13 @@ struct Lower<'a> {
     console_flat: Option<V>,
     /// Group-shared slots the two halves exchange a dword through.
     xchg: Option<V>,
+    /// Groups of several console waves: slots, arrival flags and the count of
+    /// exchanges made so far (see `Lower::exchange_waves`).
+    xwaves: Option<(V, V, V)>,
+    /// Console flow, several console waves per group: the ballot of a mask and
+    /// the DXIL block it was taken in, which only that block's code may use
+    /// (the exchange makes blocks, and a use elsewhere need not follow it).
+    ballots_at: HashMap<Value, (usize, (V, V))>,
     /// Mesh: the thread index in the group (made in the entry block).
     flat: Option<V>,
     /// Mesh: IR blocks whose `s_barrier` is left out.
@@ -1203,7 +1210,7 @@ impl<'a> Lower<'a> {
                 && x.native.wave64
                 && !x.target.runs(64)
                 && x.target.runs(32)
-                && cs.threads.iter().product::<u32>() <= 64
+                && (cs.threads.iter().product::<u32>() <= 64 || s.lds_dwords == 0)
                 && !insts().any(|i| i.name().contains("permute"));
             // On a host that runs the console's wave size: lane reads and
             // writes in a program whose lanes branch differently (see
@@ -1328,6 +1335,8 @@ impl<'a> Lower<'a> {
             wants_console_flow,
             console_flat: None,
             xchg: None,
+            xwaves: None,
+            ballots_at: HashMap::new(),
             flat: None,
             no_barrier,
             half_outputs: half_outputs(&x.native.io, &x.outputs),
@@ -1911,6 +1920,7 @@ impl<'a> Lower<'a> {
                     );
                     let total = if float { self.as_int(total) } else { total };
                     let (lo, _) = self.exchange(c, total);
+                    let c = self.cur;
                     let lo = if float { self.as_float(lo) } else { lo };
                     let (_, half) = self.console_lane();
                     let zero = self.s.m.i32(0);
@@ -1980,6 +1990,7 @@ impl<'a> Lower<'a> {
         let c = self.cur;
         let bits = if float { self.as_int(r) } else { r };
         let (lo, hi) = self.exchange(c, bits);
+        let c = self.cur;
         let (a, b) = if float {
             (self.as_float(lo), self.as_float(hi))
         } else {
@@ -3101,7 +3112,17 @@ impl<'a> Lower<'a> {
         if self.console_cf {
             // Every lane runs every block: the mask's bits are the lanes'
             // own, both halves' words exchanged.
-            if let Some(&xy) = self.ballots.get(&lo) {
+            let multi = self
+                .s
+                .threads
+                .is_some_and(|t| t.iter().product::<u32>() > 64);
+            if multi {
+                if let Some(&(blk, xy)) = self.ballots_at.get(&lo)
+                    && blk == self.cur
+                {
+                    return Ok(xy);
+                }
+            } else if let Some(&xy) = self.ballots.get(&lo) {
                 return Ok(xy);
             }
             let at = match self.def_block.get(&lo) {
@@ -3110,6 +3131,14 @@ impl<'a> Lower<'a> {
                 Some(&b) => self.tail[b].ok_or("a lane mask written after its use")?,
             };
             let bit = self.boolean(m, at)?;
+            if multi {
+                // The halves meet in the block using the mask: the exchange
+                // makes blocks, which one that is done cannot take.
+                let here = self.cur;
+                let xy = self.console_ballot(here, bit);
+                self.ballots_at.insert(lo, (self.cur, xy));
+                return Ok(xy);
+            }
             let xy = self.console_ballot(at, bit);
             self.ballots.insert(lo, xy);
             return Ok(xy);
@@ -4464,6 +4493,7 @@ impl<'a> Lower<'a> {
         let at = self.s.m.bin(c, Bin::And, lane, k31);
         let mine = self.read_lane(x, at);
         let (x0, x1) = self.exchange(c, mine);
+        let c = self.cur;
         let h = self.s.m.bin(c, Bin::LShr, lane, k5);
         let h = self.s.m.bin(c, Bin::And, h, one);
         let low = self.s.m.cmp(c, pred::EQ, h, z);
@@ -5074,6 +5104,32 @@ impl<'a> Lower<'a> {
             && self.ordered();
         if fence {
             self.uav_fence();
+        }
+        // Several console waves per group: the halves' exchange makes blocks, and
+        // the lowering of an instruction keeps the block it began in. Masks it
+        // reads whole are exchanged first.
+        if self.console_cf
+            && self.split
+            && self.s.threads.is_some_and(|t| t.iter().product::<u32>() > 64)
+        {
+            for &(_, r) in &inst.reads {
+                let lo = if self.x.st.masks.contains_key(&r) {
+                    Some(r)
+                } else if let Some(&lo) = self.x.st.highs.get(&r) {
+                    Some(lo)
+                } else {
+                    self.mask_scc.get(&r).copied()
+                };
+                if let Some(lo) = lo
+                    && (reads_mask_as_data(self.x.st, inst)
+                        || self.mask_scc.contains_key(&r)
+                        || self.mask_numbers.contains(&r)
+                        || mask_set_op(name)
+                            && inst.writes.iter().any(|w| self.mask_numbers.contains(&w.1)))
+                {
+                    let _ = self.mask_ballot(lo);
+                }
+            }
         }
         let r = match &inst.fields {
             Fields::Sop { .. } => self.sop(inst),
@@ -8375,6 +8431,8 @@ impl<'a> Lower<'a> {
                 } else {
                     self.s.m.i32(0)
                 };
+                // The exchanges of the words may have moved the code on.
+                let c = self.cur;
                 let i32t = self.s.t.i32;
                 let flo = self
                     .s
@@ -12636,6 +12694,12 @@ impl<'a> Lower<'a> {
             }
             _ => return Err("a branch the console flow does not model"),
         };
+        // The exchange may have moved the code on to another block.
+        let c = if self.s.threads.is_some_and(|t| t.iter().product::<u32>() > 64) {
+            self.cur
+        } else {
+            c
+        };
         Ok(if set {
             any
         } else {
@@ -12673,6 +12737,7 @@ impl<'a> Lower<'a> {
         let c = self.cur;
         let bit = self.boolean(m, c)?;
         let (lo, hi) = self.console_ballot(c, bit);
+        let c = self.cur;
         let or = self.s.m.bin(c, Bin::Or, lo, hi);
         let z = self.s.m.i32(0);
         Ok(self.s.m.cmp(c, pred::NE, or, z))
@@ -12757,6 +12822,105 @@ impl<'a> Lower<'a> {
         (lane, half)
     }
 
+    /// Console flow, a group of several console waves: the halves of one console
+    /// wave meet through group-shared slots and arrival flags instead of a group
+    /// barrier, which the other console waves (taking other paths) would not
+    /// reach. The k-th exchange of a half stores its dword in slot (wave, half,
+    /// k parity), fences, and sets its flag to k + 1; it waits for the other
+    /// half's flag to reach k + 1 (a bounded spin, in case that half left the
+    /// dispatch early), fences and reads the slot. The other half is at most one
+    /// exchange ahead, and the parity keeps it from overwriting a slot still
+    /// being read. Code goes on in `self.cur` afterwards (not the block given).
+    fn exchange_waves(&mut self, x: V) -> (V, V) {
+        const SPIN_LIMIT: u32 = 1 << 20;
+        let threads: u32 = self.s.threads.expect("compute").iter().product();
+        let waves = threads.div_ceil(64);
+        let i32t = self.s.t.i32;
+        let (slots, flags, count) = match self.xwaves {
+            Some(t) => t,
+            None => {
+                let a = self.s.m.array(waves * 4, i32t);
+                let slots = self.s.m.global("xslots", a, 3);
+                let f = self.s.m.array(waves * 2, i32t);
+                let flags = self.s.m.global("xflags", f, 3);
+                let e = self.s.entry;
+                let count = self.s.m.alloca(e, i32t);
+                let z = self.s.m.i32(0);
+                self.s.m.store(e, count, z);
+                self.xwaves = Some((slots, flags, count));
+                (slots, flags, count)
+            }
+        };
+        let flat = self.console_flat();
+        let (_, half) = self.console_lane();
+        let c = self.cur;
+        let (z, one, two, four, k6, k64, k32) = (
+            self.s.m.i32(0),
+            self.s.m.i32(1),
+            self.s.m.i32(2),
+            self.s.m.i32(4),
+            self.s.m.i32(6),
+            self.s.m.i32(64),
+            self.s.m.i32(32),
+        );
+        let w = self.s.m.bin(c, Bin::LShr, flat, k6);
+        let k = self.s.m.load(c, count);
+        let k1 = self.s.m.bin(c, Bin::Add, k, one);
+        self.s.m.store(c, count, k1);
+        let parity = self.s.m.bin(c, Bin::And, k, one);
+        let w4 = self.s.m.bin(c, Bin::Mul, w, four);
+        let other = self.s.m.bin(c, Bin::Xor, half, one);
+        let h2 = self.s.m.bin(c, Bin::Mul, half, two);
+        let o2 = self.s.m.bin(c, Bin::Mul, other, two);
+        let mine = self.s.m.bin(c, Bin::Add, w4, h2);
+        let mine = self.s.m.bin(c, Bin::Add, mine, parity);
+        let theirs = self.s.m.bin(c, Bin::Add, w4, o2);
+        let theirs = self.s.m.bin(c, Bin::Add, theirs, parity);
+        let w2 = self.s.m.bin(c, Bin::Mul, w, two);
+        let my_flag = self.s.m.bin(c, Bin::Add, w2, half);
+        let their_flag = self.s.m.bin(c, Bin::Add, w2, other);
+        // The lower half of a console wave of 32 threads or fewer has no partner.
+        let wb = self.s.m.bin(c, Bin::Mul, w, k64);
+        let upper = self.s.m.bin(c, Bin::Add, wb, k32);
+        let t = self.s.m.i32(threads);
+        let beyond = self.s.m.cmp(c, pred::IUGE, upper, t);
+        let lower = self.s.m.cmp(c, pred::EQ, half, z);
+        let alone = self.s.m.bin(c, Bin::And, beyond, lower);
+        let void = self.s.t.void;
+        let fence = self.s.m.i32(8);
+        let slot = self.s.m.element(c, slots, mine);
+        self.s.m.store(c, slot, x);
+        self.s
+            .op(c, "barrier", Attr::NoDuplicate, void, 80, &[fence]);
+        let flag = self.s.m.element(c, flags, my_flag);
+        self.s.m.atomic(c, Rmw::Xchg, flag, k1);
+        let spin = self.s.m.new_block();
+        let done = self.s.m.new_block();
+        self.s.m.terminate(c, Term::Br(spin));
+        let n = self.s.m.phi(spin, i32t);
+        let theirs_flag = self.s.m.element(spin, flags, their_flag);
+        let seen = self.s.m.atomic(spin, Rmw::Or, theirs_flag, z);
+        let arrived = self.s.m.cmp(spin, pred::IUGE, seen, k1);
+        let next = self.s.m.bin(spin, Bin::Add, n, one);
+        let limit = self.s.m.i32(SPIN_LIMIT);
+        let over = self.s.m.cmp(spin, pred::IUGE, next, limit);
+        let stop = self.s.m.bin(spin, Bin::Or, arrived, over);
+        let stop = self.s.m.bin(spin, Bin::Or, stop, alone);
+        self.s.m.set_phi(n, vec![(z, c), (next, spin)]);
+        self.s.m.terminate(spin, Term::CondBr(stop, done, spin));
+        self.s.m.continue_in(c, done);
+        self.cur = done;
+        self.s
+            .op(done, "barrier", Attr::NoDuplicate, void, 80, &[fence]);
+        let slot = self.s.m.element(done, slots, theirs);
+        let got = self.s.m.load(done, slot);
+        let got = self.s.m.select(done, alone, z, got);
+        let first = self.s.m.cmp(done, pred::EQ, half, z);
+        let lo = self.s.m.select(done, first, x, got);
+        let hi = self.s.m.select(done, first, got, x);
+        (lo, hi)
+    }
+
     /// Console flow: each half gives `x` (the same in all its lanes) and
     /// both get (the lower half's, the upper half's): through two group-
     /// shared dwords between group barriers, which every thread of the
@@ -12767,6 +12931,11 @@ impl<'a> Lower<'a> {
         let z = self.s.m.i32(0);
         if threads <= 32 {
             return (x, z);
+        }
+        if threads > 64 {
+            // Several console waves: the exchange makes blocks; the code
+            // goes on in `self.cur`.
+            return self.exchange_waves(x);
         }
         let (_, half) = self.console_lane();
         let slots = match self.xchg {
