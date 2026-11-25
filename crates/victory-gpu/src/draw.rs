@@ -59,6 +59,19 @@ struct Fixed {
     blend: Option<Option<[f32; 4]>>,
     stencil: Option<u32>,
     views: Option<(Vec<crate::descriptor::RtvRecord>, Option<crate::descriptor::RtvRecord>)>,
+    /// What the host list has bound as render targets and depth, once it has
+    /// (host texture and [`crate::descriptor::RtvRecord::key`] per view): the
+    /// title sets the same targets again and again (after ZJOU acf478b8 and
+    /// AvatarManz ca1d519; `VICTORY_BIND_CACHE=0` sets them every time).
+    host_bound: Option<BoundKeys>,
+}
+
+/// The views of a bind, by host texture and view description.
+type BoundKeys = (Vec<(usize, (usize, [u32; 7]))>, Option<(usize, (usize, [u32; 7]))>);
+
+fn bind_cache() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_BIND_CACHE").map_or(true, |v| v != "0"))
 }
 
 // SAFETY: the views only name title resources.
@@ -217,9 +230,7 @@ fn root_view(list: &HostList, address: u64, kind: u8) -> Option<u64> {
         }
         return Some(gpu);
     }
-    let (gpu, to) = list.scratch(len)?;
-    list.defer_fill(to, address as *const u8, len as usize);
-    Some(gpu)
+    list.fill_scratch(address as *const u8, len).map(|(gpu, _)| gpu)
 }
 
 /// Tables from this many entries on are made once for every length shaders
@@ -411,6 +422,8 @@ impl State {
         if let Some(reference) = self.fixed.stencil {
             stencil_ref(list, reference);
         }
+        // A new host list has bound nothing yet.
+        self.fixed.host_bound = None;
         if let Some((targets, depth)) = self.fixed.views.take() {
             self.bind_targets(list, targets, depth);
         }
@@ -461,7 +474,8 @@ impl State {
             return;
         };
         self.targets.clear();
-        let mut rtvs = Vec::new();
+        let mut views = Vec::with_capacity(targets.len());
+        let mut keys = Vec::with_capacity(targets.len());
         for record in &targets {
             let Some(texture) = crate::resource::host_resource(record.resource) else {
                 continue;
@@ -469,7 +483,8 @@ impl State {
             self.targets.push(record.resource as usize);
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(record.resource);
-            rtvs.push(host.rtv(texture, record.desc().as_ref()));
+            views.push((texture, record.desc()));
+            keys.push((texture.as_raw() as usize, record.key()));
         }
         self.depth = 0;
         let dsv = depth.and_then(|record| {
@@ -477,8 +492,16 @@ impl State {
             self.depth = record.resource as usize;
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(record.resource);
-            Some(host.dsv(texture, record.depth_desc().as_ref()))
+            Some((texture, record))
         });
+        let now = (keys, dsv.as_ref().map(|(texture, record)| (texture.as_raw() as usize, record.key())));
+        if bind_cache() && self.fixed.host_bound.as_ref() == Some(&now) {
+            self.fixed.views = Some((targets, depth));
+            return;
+        }
+        self.fixed.host_bound = Some(now);
+        let rtvs: Vec<_> = views.iter().map(|(texture, desc)| host.rtv(texture, desc.as_ref())).collect();
+        let dsv = dsv.map(|(texture, record)| host.dsv(texture, record.depth_desc().as_ref()));
         // SAFETY: an open list; the views were just made.
         unsafe {
             list.list.OMSetRenderTargets(
@@ -751,10 +774,8 @@ impl State {
                 self.apply_depth_bounds(list);
             }
             self.host_pipeline = p.pso.as_raw() as usize;
-            list.used_pipeline(&p.name);
             // The title may release the pipeline before it submits the list.
-            list.keep(&p.pso);
-            list.keep(&p.root);
+            list.bind_pipeline(&p.name, &p.pso, &p.root);
         }
         if p.stages.iter().any(|s| s.translated().resource_heap)
             && self.heaps[0] != 0
