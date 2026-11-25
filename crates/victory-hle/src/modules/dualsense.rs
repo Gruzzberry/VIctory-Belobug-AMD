@@ -211,7 +211,17 @@ fn open_pad() -> Option<Pad> {
     None
 }
 
-/// Every present HID interface's device path.
+/// An owned copy of a UTF-16 path with its NUL terminator. `CreateFileW` reads
+/// up to a NUL, so a copy without one is read past its end: an access violation
+/// when the allocation ends at a page boundary.
+fn wide_c_string(path: &[u16]) -> Vec<u16> {
+    let mut owned = Vec::with_capacity(path.len() + 1);
+    owned.extend_from_slice(path);
+    owned.push(0);
+    owned
+}
+
+/// Every present HID interface's device path, each NUL-terminated.
 fn device_paths() -> Vec<Vec<u16>> {
     let mut paths = Vec::new();
     // SAFETY: the HID interface class, no enumerator or parent window.
@@ -288,7 +298,7 @@ fn device_paths() -> Vec<Vec<u16>> {
             len += 1;
         }
         // SAFETY: `path` is valid for `len` u16s in the live buffer.
-        paths.push(unsafe { std::slice::from_raw_parts(path, len) }.to_vec());
+        paths.push(wide_c_string(unsafe { std::slice::from_raw_parts(path, len) }));
     }
     // SAFETY: the set is ours.
     unsafe { SetupDiDestroyDeviceInfoList(set) };
@@ -417,6 +427,16 @@ fn state(sticks: [u32; 4], triggers: [u32; 2], hat: u32, usages: &[u16]) -> Read
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn device_paths_keep_their_terminator() {
+        let path: Vec<u16> = r"\\?\hid#vid_054c&pid_0ce6".encode_utf16().collect();
+        let owned = wide_c_string(&path);
+        assert_eq!(owned.len(), path.len() + 1);
+        assert_eq!(owned[..path.len()], path[..]);
+        assert_eq!(owned.last(), Some(&0));
+        assert_eq!(wide_c_string(&[]), [0]);
+    }
 
     const CENTER: [u32; 4] = [128, 128, 128, 128];
     const UP_NEUTRAL: u32 = 8;
