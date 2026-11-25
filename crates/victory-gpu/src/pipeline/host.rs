@@ -497,6 +497,7 @@ impl HostPipeline {
                 ..Default::default()
             };
             let name = super::library::name("compute", &root_blob, &[&code_bytes(&code(0))], "");
+            super::library::inspect(&name, "compute", &format!("{shaders:?}"), &root_blob, &[&code_bytes(&code(0))], "");
             let made = super::library::pipeline(
                 &name,
                 // SAFETY: the description points at live data.
@@ -537,6 +538,10 @@ impl HostPipeline {
                 &root_blob,
                 &[&code_bytes(&code(0)), &code_bytes(&code(1))],
                 &state,
+            );
+            super::library::inspect(
+                &name, "mesh", &format!("{shaders:?}"), &root_blob,
+                &[&code_bytes(&code(0)), &code_bytes(&code(1))], &state,
             );
             let ms = Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, code(0));
             let made = match depth_with_bounds {
@@ -618,6 +623,10 @@ impl HostPipeline {
             &root_blob,
             &[&code_bytes(&code(0)), &code_bytes(&code(1))],
             &state,
+        );
+        super::library::inspect(
+            &name, "graphics", &format!("{shaders:?}"), &root_blob,
+            &[&code_bytes(&code(0)), &code_bytes(&code(1))], &state,
         );
         let made = if let Some(depth) = depth_with_bounds {
             let vertex = VertexStream {

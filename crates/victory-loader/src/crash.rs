@@ -441,6 +441,7 @@ unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
 /// # Safety
 /// `info` comes from the system, for an exception being dispatched.
 pub unsafe fn report_unhandled(info: *const EXCEPTION_POINTERS) {
+    victory_core::unhandled::call_hook(info.cast());
     // SAFETY: forwarded from the caller.
     unsafe { report("unhandled exception", info, true) };
 }
