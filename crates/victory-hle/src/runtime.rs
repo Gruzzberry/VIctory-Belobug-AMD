@@ -204,6 +204,22 @@ pub fn use_console_timers() {
         );
         timeBeginPeriod(1);
     }
+    ahead_of_other_programs();
+}
+
+/// `VICTORY_PROCESS_PRIORITY=above`: the process runs above normal priority.
+/// AvatarManz c278c67 does this by default (a program keeping the processors
+/// busy at normal priority starved the title's loading threads); here it is
+/// opt-in until measured on the 4070 with the shader precompile running.
+#[cfg(windows)]
+fn ahead_of_other_programs() {
+    use windows_sys::Win32::System::Threading::{ABOVE_NORMAL_PRIORITY_CLASS, GetCurrentProcess, SetPriorityClass};
+    if !std::env::var_os("VICTORY_PROCESS_PRIORITY").is_some_and(|v| v == "above") {
+        return;
+    }
+    // SAFETY: a plain process setting.
+    let set = unsafe { SetPriorityClass(GetCurrentProcess(), ABOVE_NORMAL_PRIORITY_CLASS) } != 0;
+    tracing::info!(set, "the process runs above normal priority (VICTORY_PROCESS_PRIORITY=above)");
 }
 
 #[cfg(test)]
