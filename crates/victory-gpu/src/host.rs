@@ -161,6 +161,14 @@ static SUBMISSION_US: [std::sync::atomic::AtomicU64; 2] =
 static COPY_BACK: [std::sync::atomic::AtomicU64; 2] =
     [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
 
+/// Of [`COPY_BACK`]'s time, microseconds: the card's finish, CPU copies
+/// compared and put back, readbacks of textures.
+static COPY_BACK_PARTS: [std::sync::atomic::AtomicU64; 3] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
 /// Bindless heaps' slots made ready (microseconds), since the last
 /// frame-rate line: plans at submission (part of the preparing), and
 /// placed textures as draws are recorded.
@@ -1446,6 +1454,8 @@ impl Host {
                 plan.clear_pending();
             }
         }
+        COPY_BACK_PARTS[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
+        let cpu_started = std::time::Instant::now();
         let back = cpu_back;
         if back.len() <= 1 {
             for (shadow, address, len) in &back {
@@ -1483,6 +1493,8 @@ impl Host {
                 });
             }
         }
+        COPY_BACK_PARTS[1].fetch_add(cpu_started.elapsed().as_micros() as u64, Ordering::Relaxed);
+        let readbacks_started = std::time::Instant::now();
         for list in runs {
             for rb in &list.deferred().readbacks {
                 let written = if rb.dst_pitch == rb.row_bytes && rb.src_pitch == rb.row_bytes {
@@ -1504,6 +1516,7 @@ impl Host {
                 COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
             }
         }
+        COPY_BACK_PARTS[2].fetch_add(readbacks_started.elapsed().as_micros() as u64, Ordering::Relaxed);
         COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
         // Host timestamps the lists resolved, on the title's GPU clock.
         let mut clock = None;
@@ -3461,6 +3474,8 @@ impl Meter {
         let [back_ms, back_mb] = [0, 1].map(|i| {
             COPY_BACK[i].swap(0, Ordering::Relaxed) as f64 / [1e3, 1e6][i] / frames
         });
+        let [back_card, back_cpu, back_readback] =
+            [0, 1, 2].map(|i| COPY_BACK_PARTS[i].swap(0, Ordering::Relaxed) as f64 / 1e3 / frames);
         let [plans_ms, records_ms] =
             [0, 1].map(|i| BINDLESS_US[i].swap(0, Ordering::Relaxed) as f64 / 1e3 / frames);
         let dropped = crate::draw::take_dropped() as f64 / frames;
@@ -3479,7 +3494,7 @@ impl Meter {
             tracing::info!(
                 "[{} {}] {fps:.1} fps, {ms:.1} ms/frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \
                  {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB, bindless plans \
-                 {plans_ms:.1} ms; {gpu:.1} on the GPU; {back_ms:.1} copying back {back_mb:.1} MB; \
+                 {plans_ms:.1} ms; {gpu:.1} on the GPU; {back_ms:.1} copying back {back_mb:.1} MB (card {back_card:.1}, cpu {back_cpu:.1}, readbacks {back_readback:.1}); \
                  bindless records {records_ms:.1} ms), {draws:.0} draws/frame, \
                  dropped {dropped:.0} without a host pipeline ({making} being made) and \
                  {indirect:.0} indirect",

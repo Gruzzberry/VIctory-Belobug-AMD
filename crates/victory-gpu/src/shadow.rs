@@ -1959,19 +1959,37 @@ impl Shadow {
     fn sparse_back(&self, s: &Sparse, address: usize, len: usize) -> usize {
         let mut before = s.before.lock().unwrap_or_else(|e| e.into_inner());
         let start = self.start as usize;
-        let mut written = 0;
-        let mut title: Option<Vec<u8>> = None;
+        // The tiles the range covers that have a snapshot, each with its own
+        // snapshot taken out of the map: tiles are independent, so a long
+        // range is compared and merged on several threads
+        // (`VICTORY_BACK_THREADS=1`: one, as before).
+        struct Job {
+            at: usize,
+            data: *mut u8,
+            n: usize,
+            key: u32,
+            old: Vec<u8>,
+        }
+        // SAFETY: the tile's mapping is written by the one thread that has
+        // the job; the title's bytes are only read and written through
+        // `read_into` / `write_mapped`, as from any thread.
+        unsafe impl Send for Job {}
+        let mut jobs: Vec<Job> = Vec::new();
         self.each_tile(s, address, address + len, |at, data, n| {
-            let Some(old) = before.get_mut(&(((at - start) / PAGE) as u32)) else {
-                return;
-            };
-            let old = &mut old[at % PAGE..at % PAGE + n];
-            // SAFETY: the tile's mapping; only this thread writes it.
-            let host = unsafe { std::slice::from_raw_parts_mut(data, n) };
+            let key = ((at - start) / PAGE) as u32;
+            if let Some(old) = before.remove(&key) {
+                jobs.push(Job { at, data, n, key, old });
+            }
+        });
+        let one = |job: &mut Job, title: &mut Option<Vec<u8>>| -> usize {
+            let (at, n) = (job.at, job.n);
+            let old = &mut job.old[at % PAGE..at % PAGE + n];
+            // SAFETY: the tile's mapping; only this job writes it.
+            let host = unsafe { std::slice::from_raw_parts_mut(job.data, n) };
             #[cfg(feature = "diagnostics")]
             SPARSE_WRITES[2].fetch_add(n as u64, Ordering::Relaxed);
             if host == old {
-                return;
+                return 0;
             }
             #[cfg(feature = "diagnostics")]
             SPARSE_WRITES[3].fetch_add(n as u64, Ordering::Relaxed);
@@ -1981,23 +1999,52 @@ impl Shadow {
                 v
             });
             if !crate::host::read_into(at as *const u8, &mut buf[..n]) {
-                return;
+                return 0;
             }
-            if let Some((dirty_start, dirty_end)) =
-                merge_gpu_writes_mut(&mut buf[..n], host, old)
-            {
+            if let Some((dirty_start, dirty_end)) = merge_gpu_writes_mut(&mut buf[..n], host, old) {
                 let dirty_len = dirty_end - dirty_start;
                 crate::watch::writing(at + dirty_start, dirty_len);
-                crate::host::write_mapped(
-                    (at + dirty_start) as *mut u8,
-                    buf[dirty_start..].as_ptr(),
-                    dirty_len,
-                );
-                written += dirty_len;
+                crate::host::write_mapped((at + dirty_start) as *mut u8, buf[dirty_start..].as_ptr(), dirty_len);
+                return dirty_len;
             }
-        });
-        if let Some(buf) = title {
-            give_back(buf);
+            0
+        };
+        let threads = back_threads().min(jobs.len() / BACK_TILES_LEAST).max(1);
+        let written = if threads <= 1 {
+            let mut title: Option<Vec<u8>> = None;
+            let w = jobs.iter_mut().map(|job| one(job, &mut title)).sum();
+            if let Some(buf) = title {
+                give_back(buf);
+            }
+            w
+        } else {
+            let per = jobs.len().div_ceil(threads * 4).max(1);
+            let next = std::sync::atomic::AtomicUsize::new(0);
+            let total = std::sync::atomic::AtomicUsize::new(0);
+            let slices: Vec<Mutex<&mut [Job]>> = jobs.chunks_mut(per).map(Mutex::new).collect();
+            let work = || {
+                let mut title: Option<Vec<u8>> = None;
+                loop {
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(slice) = slices.get(i) else { break };
+                    let mut slice = slice.lock().unwrap_or_else(|e| e.into_inner());
+                    let w: usize = slice.iter_mut().map(|job| one(job, &mut title)).sum();
+                    total.fetch_add(w, Ordering::Relaxed);
+                }
+                if let Some(buf) = title {
+                    give_back(buf);
+                }
+            };
+            std::thread::scope(|scope| {
+                for _ in 1..threads {
+                    scope.spawn(&work);
+                }
+                work();
+            });
+            total.load(Ordering::Relaxed)
+        };
+        for job in jobs {
+            before.insert(job.key, job.old);
         }
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
         pending.retain(|&r| r != (address, address + len));
@@ -2006,6 +2053,16 @@ impl Shadow {
         }
         written
     }
+}
+
+/// Tiles (64 KiB) a thread of a sparse copy-back has at least.
+const BACK_TILES_LEAST: usize = 16;
+
+/// Threads one sparse copy-back may use for a long range
+/// (`VICTORY_BACK_THREADS`, default 4; 1 = one thread as before).
+fn back_threads() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| std::env::var("VICTORY_BACK_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(4).clamp(1, 16))
 }
 
 /// Merges bytes the GPU changed (`host != old`) into `title`, syncs `host` to
