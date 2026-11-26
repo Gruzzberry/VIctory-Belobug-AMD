@@ -2059,10 +2059,10 @@ impl Shadow {
 const BACK_TILES_LEAST: usize = 16;
 
 /// Threads one sparse copy-back may use for a long range
-/// (`VICTORY_BACK_THREADS`, default 4; 1 = one thread as before).
+/// (`VICTORY_BACK_THREADS`, default 1 = one thread as before; 4 halved copy-back in tests but 2 of 7 runs lost the device, so it is opt-in).
 fn back_threads() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *N.get_or_init(|| std::env::var("VICTORY_BACK_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(4).clamp(1, 16))
+    *N.get_or_init(|| std::env::var("VICTORY_BACK_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(1).clamp(1, 16))
 }
 
 /// Merges bytes the GPU changed (`host != old`) into `title`, syncs `host` to
